@@ -21,7 +21,6 @@ jobs:
     timeout-minutes: 120
     env:
       T3CODE_DESKTOP_UPDATE_REPOSITORY: shi-5c/t3code
-      T3CODE_HOME: ${{ runner.temp }}/t3-snapshot-home
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
       - uses: actions/checkout@v6
@@ -50,6 +49,7 @@ jobs:
       - name: Record toolchain and source
         shell: pwsh
         run: |
+          "T3CODE_HOME=$env:RUNNER_TEMP/t3-snapshot-home" >> $env:GITHUB_ENV
           node --version
           vp --version
           python --version
