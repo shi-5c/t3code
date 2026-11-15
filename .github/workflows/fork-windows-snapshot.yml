@@ -72,6 +72,17 @@ jobs:
       - name: Build unsigned Windows x64 installer
         run: vp run dist:desktop:win:x64 --build-version 0.0.0-snapshot.${{ github.run_number }} --output-dir release-snapshot
 
+      - name: Diagnose failed payload validation
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath release-snapshot) {
+            $root = (Resolve-Path -LiteralPath release-snapshot).Path
+            Get-ChildItem -LiteralPath $root -Recurse -File | Sort-Object FullName | ForEach-Object {
+              "$($_.FullName.Substring($root.Length + 1))`t$($_.Length)"
+            }
+          }
+
       - name: Hash installer and record provenance
         shell: pwsh
         run: |
