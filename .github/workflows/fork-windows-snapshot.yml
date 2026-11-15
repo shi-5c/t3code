@@ -70,15 +70,19 @@ jobs:
         run: vp fmt --check .github/workflows/fork-windows-snapshot.yml docs/operations/codex-desktop-fork.md apps/desktop/src/electron/ElectronShell.test.ts apps/web/src/components/chat/NativeSharedConversation.browser.test.tsx
 
       - name: Build unsigned Windows x64 installer
-        run: vp run dist:desktop:win:x64 --build-version 0.0.0-snapshot.${{ github.run_number }} --output-dir release-snapshot
+        run: vp run dist:desktop:win:x64 --build-version 0.0.0-snapshot.${{ github.run_number }} --output-dir release-snapshot --keep-stage
 
       - name: Diagnose failed payload validation
         if: failure()
         shell: pwsh
         run: |
-          if (Test-Path -LiteralPath release-snapshot) {
-            $root = (Resolve-Path -LiteralPath release-snapshot).Path
-            Get-ChildItem -LiteralPath $root -Recurse -File | Sort-Object FullName | ForEach-Object {
+          $stageDirs = @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 't3code-desktop-win-stage-*')
+          foreach ($stage in $stageDirs) {
+            $root = Join-Path $stage.FullName 'app/dist/win-unpacked'
+            if (!(Test-Path -LiteralPath $root)) { continue }
+            $files = @(Get-ChildItem -LiteralPath $root -Recurse -File)
+            "Payload file count: $($files.Count)"
+            $files | Sort-Object FullName | ForEach-Object {
               "$($_.FullName.Substring($root.Length + 1))`t$($_.Length)"
             }
           }
