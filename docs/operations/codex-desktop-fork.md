@@ -21,6 +21,10 @@ and uploads an unsigned x64 installer and SHA-256 manifest as temporary artifact
 It does not publish a release, publish npm packages, install the application,
 or activate the upstream synchronization workflow.
 
+This snapshot omits optional pre-generated server bytecode, matching Windows
+cross-builds. Runtime cache generation remains enabled; the tradeoff is cold-start
+performance. The 80-file payload budget and native runtime checks remain enforced.
+
 ## Acceptance
 
 Use disposable conversations and synthetic inputs. Verify:

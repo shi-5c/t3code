@@ -22,6 +22,7 @@ jobs:
     env:
       T3CODE_DESKTOP_UPDATE_REPOSITORY: shi-5c/t3code
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      T3CODE_SKIP_PREPARED_SERVER_CACHE: "1"
     steps:
       # Public checkout avoids checkout-action submodule cleanup over vendored gitlinks.
       - name: Check out public source
@@ -67,7 +68,10 @@ jobs:
         run: vp install --frozen-lockfile
 
       - name: Check snapshot formatting
-        run: vp fmt --check .github/workflows/fork-windows-snapshot.yml docs/operations/codex-desktop-fork.md apps/desktop/src/electron/ElectronShell.test.ts apps/web/src/components/chat/NativeSharedConversation.browser.test.tsx
+        run: vp fmt --check scripts/prepare-server-compile-cache.cjs scripts/prepare-server-compile-cache.test.cjs .github/workflows/fork-windows-snapshot.yml docs/operations/codex-desktop-fork.md apps/desktop/src/electron/ElectronShell.test.ts apps/web/src/components/chat/NativeSharedConversation.browser.test.tsx
+
+      - name: Test optional cache build configuration
+        run: node --test scripts/prepare-server-compile-cache.test.cjs
 
       - name: Build unsigned Windows x64 installer
         run: vp run dist:desktop:win:x64 --build-version 0.0.0-snapshot.${{ github.run_number }} --output-dir release-snapshot --keep-stage
@@ -94,7 +98,7 @@ jobs:
           if ($installers.Count -eq 0) { throw "No installer was produced" }
           $lines = $installers | ForEach-Object { $h = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256; "$($h.Hash.ToLower())  $($_.Name)" }
           $lines | Set-Content -LiteralPath release-snapshot/SHA256SUMS.txt -Encoding utf8
-          @("Source: $env:GITHUB_SHA", "Run: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID", "Signing: unsigned", "Target: Windows x64", "Rust: 1.95.0") | Set-Content -LiteralPath release-snapshot/BUILD.txt -Encoding utf8
+          @("Source: $env:GITHUB_SHA", "Run: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID", "Signing: unsigned", "Target: Windows x64", "Rust: 1.95.0", "Prepared server cache: omitted; runtime cache generation remains enabled") | Set-Content -LiteralPath release-snapshot/BUILD.txt -Encoding utf8
 
       - name: Upload installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
