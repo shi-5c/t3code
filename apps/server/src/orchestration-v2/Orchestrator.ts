@@ -1,3 +1,5 @@
+import { codexSharedOwnerOf } from "@t3tools/contracts";
+import { queueSharedTitle } from "../codexDesktop/sharedTitle.ts";
 import type {
   OrchestrationV2ThreadLinkMetadata,
   GuestShareId,
@@ -99,6 +101,9 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ProjectStore from "./ProjectStore.ts";
+import * as CodexSessionHistory from "../project/CodexSessionHistory.ts";
+import { refreshSharedNativeHistory } from "../project/NativeSharedHistory.ts";
+import { threadCreationUnavailableReason } from "../codexDesktop/threadCreation.ts";
 import {
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
@@ -145,6 +150,8 @@ import { withCommandMetrics } from "../observability/Metrics.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import { recoverSharedNativeRelease } from "../project/NativeSharedRecovery.ts";
+import type { ProjectId } from "@t3tools/contracts";
 import {
   DispatchModeLimit,
   exceededDispatchModeLimit,
@@ -193,6 +200,7 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
+import { desktopInstanceSwitchRefusal } from "../codexDesktop/identity.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -377,6 +385,10 @@ export interface OrchestratorV2DispatchResult {
 }
 
 export interface OrchestratorV2Shape {
+  readonly reconcileSharedRelease: (
+    threadId: ThreadId,
+    projectId: ProjectId,
+  ) => Effect.Effect<void, import("@t3tools/contracts").AgentSessionScanError>;
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   readonly recoverDelegatedTasks: Effect.Effect<void>;
   readonly recoverDelegatedTask: (threadId: ThreadId, sourceRunId: RunId) => Effect.Effect<void>;
@@ -1159,6 +1171,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const commandReceipts = yield* CommandReceiptStoreV2;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
+  const nativeHistory = Option.getOrUndefined(
+    yield* Effect.serviceOption(CodexSessionHistory.CodexSessionHistory),
+  );
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
   const nextTurnItemOrdinal = (
@@ -3213,9 +3228,44 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
 
+    const project = yield* projects.get(command.projectId).pipe(mapDispatchError(command));
+    const threadType =
+      command.threadType ?? Option.getOrUndefined(project)?.defaultThreadType ?? "t3";
+    const sharedMetadata =
+      threadType === "codex-shared" && providerAdapters.getMetadata
+        ? yield* providerAdapters
+            .getMetadata(command.modelSelection.instanceId)
+            .pipe(mapDispatchError(command))
+        : undefined;
+    const unavailable = threadCreationUnavailableReason(
+      threadType,
+      command.modelSelection.instanceId,
+      sharedMetadata?.driver,
+      sharedMetadata?.enabled && sharedMetadata.available === true,
+    );
+    if (unavailable)
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: unavailable,
+      });
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
     const thread: OrchestrationV2AppThread = {
+      threadType,
+      ...(threadType === "codex-shared"
+        ? {
+            codexSharedOwner: "native" as const,
+            codexTitleSync: {
+              status: "pending" as const,
+              version: 1,
+              desiredTitle: command.title,
+              ownerTitle: null,
+              expectedOwnerTitle: null,
+              source: "initial" as const,
+            },
+          }
+        : {}),
       createdBy: command.createdBy,
       creationSource: command.creationSource,
       id: command.threadId,
@@ -4126,7 +4176,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   };
           return {
             ...thread,
-            ...(command.title === undefined ? {} : { title: command.title }),
+            ...(command.title === undefined
+              ? {}
+              : { title: command.title, ...queueSharedTitle(thread, command.title, "manual") }),
             ...(command.limitRecovery === undefined ? {} : { limitRecovery }),
             ...(command.limitRecovery !== undefined &&
             limitRecovery?.snooze === true &&
@@ -4406,7 +4458,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return thread.titleRegeneration?.requestId === command.requestId
             ? {
                 ...thread,
-                ...(command.title === undefined ? {} : { title: command.title }),
+                ...(command.title === undefined
+                  ? {}
+                  : {
+                      title: command.title,
+                      ...queueSharedTitle(thread, command.title, "generated"),
+                    }),
                 titleRegeneration: null,
                 updatedAt: now,
               }
@@ -9769,13 +9826,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
 
       const now = yield* DateTime.now;
+      // A Desktop follower ACK confirms handling, not which racing client's answer won.
+      const waitForOwnerResolution =
+        codexSharedOwnerOf(
+          yield* projectionStore.getThread(command.threadId).pipe(mapDispatchError(command)),
+        ) === "desktop";
       const resolvedRequest = {
         ...runtimeRequest,
-        status: "resolved" as const,
-        resolvedAt: now,
-        ...(command.decision === undefined ? {} : { decision: command.decision }),
+        status: waitForOwnerResolution ? ("pending" as const) : ("resolved" as const),
+        resolvedAt: waitForOwnerResolution ? null : now,
+        ...(waitForOwnerResolution || command.decision === undefined
+          ? {}
+          : { decision: command.decision }),
         ...(command.feedback === undefined ? {} : { feedback: command.feedback }),
-        ...(answers === undefined ? {} : { answers }),
+        ...(waitForOwnerResolution || answers === undefined ? {} : { answers }),
       };
       const emitEvent = emit(events, command);
       const requestNode = context.node;
@@ -9855,7 +9919,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: resolvedRequest,
       });
-      if (requestNode !== undefined) {
+      if (requestNode !== undefined && !waitForOwnerResolution) {
         yield* emitEvent({
           type: "node.updated",
           threadId: command.threadId,
@@ -9876,7 +9940,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
-      if (approvalTurnItem !== undefined) {
+      if (approvalTurnItem !== undefined && !waitForOwnerResolution) {
         yield* emitEvent({
           type: "turn-item.updated",
           threadId: command.threadId,
@@ -13573,6 +13637,98 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
 
+    const protectedSources =
+      command.type === "thread.fork"
+        ? [command.sourceThreadId]
+        : command.type === "thread.merge_back"
+          ? [command.sourceThreadId, command.targetThreadId]
+          : command.type === "checkpoint.rollback"
+            ? [command.threadId]
+            : [];
+    for (const threadId of protectedSources) {
+      const current = yield* findThread(threadId);
+      if (
+        current?.threadType === "codex-shared" ||
+        current?.providerInstanceId === "codex-desktop"
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Fork and rewind shared conversations in Codex Desktop. T3 cannot create a bound fork or rewrite the owner's history.",
+        });
+      }
+    }
+
+    if (command.type === "thread.runtime-mode.set" || command.type === "message.dispatch") {
+      const current = yield* findThread(command.threadId);
+      if (
+        current?.threadType === "codex-shared" &&
+        current.providerInstanceId !== "codex-desktop" &&
+        (yield* providerAdapters.get(current.providerInstanceId).pipe(mapDispatchError(command)))
+          .driver !== "codex"
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "This shared conversation requires its original Codex provider. Reconnect the original conversation before sending.",
+        });
+      }
+      if (
+        current?.providerInstanceId === "codex-desktop" ||
+        current?.threadType === "codex-shared"
+      ) {
+        const reason =
+          command.type === "thread.runtime-mode.set"
+            ? "Shared execution permissions are controlled by Codex Desktop. Change them there."
+            : command.freshContext === true
+              ? "Create a new conversation in Codex Desktop, then use Connect a Codex Desktop conversation."
+              : command.idleCompaction !== undefined ||
+                  command.text.trim().toLowerCase() === "/compact"
+                ? "Run compact in Codex Desktop. Its follower receipt does not identify the execution turn; T3 displays the observed compaction state."
+                : parseGoalCommand(command) !== null
+                  ? "Manage goals in Codex Desktop; shared goal controls are not connected."
+                  : null;
+        if (reason)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: reason,
+          });
+      }
+    }
+
+    if (
+      "modelSelection" in command &&
+      command.modelSelection !== undefined &&
+      "threadId" in command
+    ) {
+      const current = yield* findThread(command.threadId);
+      if (
+        current?.threadType === "codex-shared" &&
+        command.modelSelection.instanceId !== current.providerInstanceId
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Keep this shared conversation on its original Codex provider to preserve its native identity.",
+        });
+      }
+      const refusal = current
+        ? desktopInstanceSwitchRefusal(
+            current.providerInstanceId,
+            command.modelSelection.instanceId,
+          )
+        : null;
+      if (refusal)
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: refusal,
+        });
+    }
     const events = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
     const effects = yield* Ref.make<Array<PendingOrchestrationEffectV2>>([]);
     let cancelUnsettledEffects:
@@ -14042,6 +14198,39 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
     if (Option.isSome(existingReceipt)) {
       return yield* replayCommandReceipt(command, existingReceipt.value);
+    }
+
+    // Refresh before message intake allocates a preparing/queued run. The thread
+    // dispatch lock is held here, but there is no SQL transaction during native I/O.
+    if (command.type === "message.dispatch") {
+      yield* Effect.gen(function* () {
+        const shell = yield* projectionStore.getThreadShell(command.threadId);
+        if (!shell || codexSharedOwnerOf(shell) !== "native") return;
+        const project = yield* projects.get(shell.projectId);
+        if (Option.isNone(project))
+          return yield* new ProjectStore.ProjectStoreV2Error({
+            operation: "get-shared-project",
+            cause: "Shared conversation project is unavailable.",
+          });
+        yield* refreshSharedNativeHistory({
+          threadId: command.threadId,
+          projectId: shell.projectId,
+          workspaceRoot: project.value.workspaceRoot,
+          projections: projectionStore,
+          eventSink,
+          history: nativeHistory,
+          beforeSend: true,
+        });
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            }),
+        ),
+      );
     }
 
     // Recheck under the lock; the user may have raised modes since sender preflight.
@@ -14597,6 +14786,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
     }),
     dispatch: dispatchWithReceipt,
+    reconcileSharedRelease: Effect.fn("OrchestratorV2.reconcileSharedRelease")(
+      (threadId, projectId) =>
+        threadDispatch.withLock(
+          threadId,
+          recoverSharedNativeRelease({
+            threadId,
+            projectId,
+            projections: projectionStore,
+            sessions: providerSessions,
+            runtimePolicy,
+            eventSink,
+            idAllocator,
+          }),
+        ),
+    ),
     autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
       return threadDispatch.withLock(
         input.threadId,

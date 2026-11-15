@@ -69,6 +69,32 @@ const setup = Effect.gen(function* () {
 });
 
 describe("command permissions", () => {
+  it.effect("checks the destination grant for Desktop sends and stops", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        for (const tag of [
+          WS_METHODS.codexDesktopSend,
+          WS_METHODS.codexDesktopStop,
+          WS_METHODS.codexDesktopAttachExisting,
+        ]) {
+          const desktop = createCommandPermissions(runtime, tag);
+          registry.set(sessions(env), AsyncResult.success(grant(true)));
+          registry.set(sessions(other), AsyncResult.success(grant(false)));
+          expect(registry.get(desktop.permissionAtom(env))).toBe(true);
+          expect(registry.get(desktop.permissionAtom(other))).toBe(false);
+          yield* desktop.authorize(registry, env);
+          expect((yield* desktop.authorize(registry, other).pipe(Effect.flip))._tag).toBe(
+            "EnvironmentAuthorizationError",
+          );
+          registry.set(sessions(env), AsyncResult.success(grant(false)));
+          expect((yield* desktop.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
+            "EnvironmentAuthorizationError",
+          );
+        }
+      }),
+    ),
+  );
   it.effect("requires the destination read grant to refresh providers", () =>
     Effect.scoped(
       Effect.gen(function* () {

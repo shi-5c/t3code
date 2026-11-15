@@ -895,6 +895,7 @@ describe("composerDraftStore project draft thread mapping", () => {
     const retryThreadId = ThreadId.make("thread-retry");
     store.setProjectDraftThreadId(projectRef, draftId, {
       threadId,
+      threadType: "codex-shared",
       branch: "feature/test",
       worktreePath: null,
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -914,6 +915,7 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(useComposerDraftStore.getState().getDraftThread(draftId)).toMatchObject({
       threadId: retryThreadId,
       branch: "feature/test",
+      threadType: "codex-shared",
       worktreePath: null,
       createdAt: "2026-01-01T00:01:00.000Z",
       envMode: "worktree",
@@ -922,6 +924,17 @@ describe("composerDraftStore project draft thread mapping", () => {
       interactionMode: "plan",
       promotedTo: null,
     });
+    expect(useComposerDraftStore.getState().getComposerDraft(draftId)?.prompt).toBe(
+      "keep this prompt",
+    );
+    const persisted = partializeComposerDraftStoreState(useComposerDraftStore.getState());
+    const restored = useComposerDraftStore.persist.getOptions().merge!(
+      persisted,
+      useComposerDraftStore.getInitialState(),
+    );
+    expect(restored.draftThreadsByThreadKey[draftId]?.threadType).toBe("codex-shared");
+    store.setDraftThreadContext(draftId, { threadType: "t3" });
+    expect(useComposerDraftStore.getState().getDraftThread(draftId)?.threadType).toBe("t3");
     expect(useComposerDraftStore.getState().getComposerDraft(draftId)?.prompt).toBe(
       "keep this prompt",
     );

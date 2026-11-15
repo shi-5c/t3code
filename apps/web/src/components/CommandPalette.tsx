@@ -1,3 +1,5 @@
+import { Radio, RadioGroup } from "./ui/radio-group";
+import type { ThreadType } from "@t3tools/contracts";
 import { ThreadContextDragGhost } from "./chat/ThreadContextDragGhost";
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
@@ -140,7 +142,6 @@ import {
   useProjects,
   useServerConfigs,
   useVisibleThreadShells,
-  waitForProject,
 } from "../state/entities";
 import { visibleLinkedThreads } from "@t3tools/client-runtime/state/threads";
 import { resolveThreadActionProjectRef, startNewThreadFromContext } from "../lib/chatThreadActions";
@@ -518,6 +519,7 @@ function OpenCommandPaletteDialog(props: {
     null,
   );
   const [isPickingProjectFolder, setIsPickingProjectFolder] = useState(false);
+  const [newProjectThreadType, setNewProjectThreadType] = useState<ThreadType>("t3");
   const [addProjectCloneFlow, setAddProjectCloneFlow] = useState<AddProjectCloneFlow | null>(null);
   const [newProjectFlow, setNewProjectFlow] = useState<{
     readonly environmentId: EnvironmentId;
@@ -926,6 +928,7 @@ function OpenCommandPaletteDialog(props: {
   });
 
   function popView(): void {
+    setNewProjectThreadType("t3");
     browseNavigation.invalidate();
     setAddProjectCloneFlow(null);
     setNewProjectFlow(null);
@@ -963,6 +966,7 @@ function OpenCommandPaletteDialog(props: {
   }
 
   const startAddProjectBrowse = async (environmentId: EnvironmentId): Promise<void> => {
+    setNewProjectThreadType("t3");
     const initialQuery = getAddProjectInitialQueryForEnvironment(environmentId);
     const initialBrowsePath = getBrowseDirectoryPath(initialQuery);
     const browseCwd = getBrowseCwdForEnvironment(environmentId);
@@ -990,6 +994,7 @@ function OpenCommandPaletteDialog(props: {
     source: AddProjectRemoteSource,
   ): void => {
     setAddProjectEnvironmentId(environmentId);
+    setNewProjectThreadType("t3");
     setAddProjectCloneFlow({ step: "repository", environmentId, source });
     pushPaletteView({
       addonIcon: remoteProjectSourceIcon(source, ADDON_ICON_CLASS),
@@ -1008,6 +1013,7 @@ function OpenCommandPaletteDialog(props: {
   ): void => {
     setAddProjectEnvironmentId(environmentId);
     setAddProjectCloneFlow(null);
+    setNewProjectThreadType("t3");
     setNewProjectFlow({ environmentId, sourcesEnvironmentId });
     setNewProjectPublishes(false);
     setNewProjectPublishKind(null);
@@ -1927,6 +1933,7 @@ function OpenCommandPaletteDialog(props: {
         title: inferProjectTitleFromPath(cwd),
         workspaceRoot: cwd,
         createWorkspaceRootIfMissing: true,
+        defaultThreadType: newProjectThreadType,
         defaultModelSelection: null,
       },
     });
@@ -1945,7 +1952,9 @@ function OpenCommandPaletteDialog(props: {
     }
 
     const navigationResult = await settlePromise(() =>
-      handleNewThread(scopeProjectRef(input.environmentId, projectId)),
+      handleNewThread(scopeProjectRef(input.environmentId, projectId), {
+        threadType: newProjectThreadType,
+      }),
     );
     if (navigationResult._tag === "Failure") {
       const error = squashAtomCommandFailure(navigationResult);
@@ -1994,6 +2003,7 @@ function OpenCommandPaletteDialog(props: {
       createNewProject({
         environmentId: newProjectFlow.environmentId,
         name: newProjectName,
+        defaultThreadType: newProjectThreadType,
         publishTo: newProjectPublishes ? newProjectPublishTarget : null,
       }),
     );
@@ -2175,6 +2185,7 @@ function OpenCommandPaletteDialog(props: {
         // oxlint-disable-next-line react/purity -- runs in an event handler (oxc#27309)
         createdAt: new Date().toISOString(),
         remoteUrl: addProjectCloneFlow.remoteUrl,
+        defaultThreadType: newProjectThreadType,
         destinationPath,
       },
     });
@@ -2200,8 +2211,9 @@ function OpenCommandPaletteDialog(props: {
       addProjectCloneFlow.environmentId,
       startResult.value.projectId,
     );
-    await waitForProject(projectRef, 3_000).catch(() => null);
-    const navigationResult = await settlePromise(() => handleNewThread(projectRef));
+    const navigationResult = await settlePromise(() =>
+      handleNewThread(projectRef, { threadType: newProjectThreadType }),
+    );
     if (navigationResult._tag === "Failure") {
       const error = squashAtomCommandFailure(navigationResult);
       toastManager.add(
@@ -2935,6 +2947,27 @@ function OpenCommandPaletteDialog(props: {
       showBackHint={isSubmenu}
       value={query}
     >
+      {newProjectFlow !== null || addProjectCloneFlow !== null || isBrowsing ? (
+        <div className="flex items-center gap-3 px-4 py-2 text-sm">
+          <span>New conversation default</span>
+          <RadioGroup
+            value={newProjectThreadType}
+            aria-label="New project conversation default"
+            onValueChange={(value) => {
+              if (value === "t3" || value === "codex-shared") setNewProjectThreadType(value);
+            }}
+          >
+            <label className="flex items-center gap-2">
+              <Radio value="t3" />
+              T3 owned
+            </label>
+            <label className="flex items-center gap-2">
+              <Radio value="codex-shared" />
+              Codex shared
+            </label>
+          </RadioGroup>
+        </div>
+      ) : null}
       {newProjectPathPreview !== null ? (
         <NewProjectSummary
           name={newProjectName}

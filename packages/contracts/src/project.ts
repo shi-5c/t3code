@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import { RepositoryIdentity, ThreadEnvMode } from "./environment.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import { ThreadType } from "./threadType.ts";
 import {
   CommandId,
   ForwardCompatibleUnion,
@@ -151,6 +152,7 @@ export const ReceivedProjectIcon = ForwardCompatibleUnion(projectIconMembers, "k
 );
 
 export const Project = Schema.Struct({
+  defaultThreadType: Schema.optional(ThreadType),
   id: ProjectId,
   title: TrimmedNonEmptyString,
   workspaceRoot: TrimmedNonEmptyString,
@@ -177,6 +179,7 @@ export const ProjectSnapshot = Schema.Struct({
 export type ProjectSnapshot = typeof ProjectSnapshot.Type;
 
 export const ProjectCreatePayload = Schema.Struct({
+  defaultThreadType: Schema.optional(ThreadType),
   title: TrimmedNonEmptyString,
   workspaceRoot: TrimmedNonEmptyString,
   createWorkspaceRootIfMissing: Schema.optional(Schema.Boolean),
@@ -186,6 +189,7 @@ export const ProjectCreatePayload = Schema.Struct({
 export type ProjectCreatePayload = typeof ProjectCreatePayload.Type;
 
 export const ProjectUpdatePayload = Schema.Struct({
+  defaultThreadType: Schema.optional(ThreadType),
   title: Schema.optional(TrimmedNonEmptyString),
   workspaceRoot: Schema.optional(TrimmedNonEmptyString),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
@@ -525,6 +529,7 @@ export const ProjectEnsureScratchResult = Schema.Struct({
 export type ProjectEnsureScratchResult = typeof ProjectEnsureScratchResult.Type;
 
 export const ProjectCreateNewInput = Schema.Struct({
+  defaultThreadType: Schema.optionalKey(ThreadType),
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(200)),
 });
 export type ProjectCreateNewInput = typeof ProjectCreateNewInput.Type;

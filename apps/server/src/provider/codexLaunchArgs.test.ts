@@ -2,7 +2,25 @@ import * as NodeAssert from "node:assert/strict";
 
 import { describe, it } from "vite-plus/test";
 
-import { codexAppServerArgs, codexExecLaunchArgs } from "./codexLaunchArgs.ts";
+import {
+  codexAppServerArgs,
+  codexExecLaunchArgs,
+  sharedCodexNativeOverrideError,
+} from "./codexLaunchArgs.ts";
+
+it("refuses native shared account overrides without exposing values", () => {
+  for (const env of [
+    { T3CODE_CODEX_LAUNCH_ARGS: "--config model_provider=custom" },
+    { OPENAI_API_KEY: "test-private-value" },
+    { OPENAI_BASE_URL: "test-private-value" },
+  ]) {
+    const error = sharedCodexNativeOverrideError("", env);
+    NodeAssert.ok(error);
+    NodeAssert.ok(!error.includes("test-private-value"));
+  }
+  NodeAssert.ok(sharedCodexNativeOverrideError("--profile alternate", {}));
+  NodeAssert.equal(sharedCodexNativeOverrideError("", { CODEX_HOME: "/desktop-home" }), null);
+});
 
 describe("codexAppServerArgs", () => {
   it("preserves escaped TOML quotes in config values", () => {

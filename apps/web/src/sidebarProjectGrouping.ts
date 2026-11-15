@@ -36,6 +36,8 @@ export interface SidebarProjectGroupMember extends Project {
 }
 
 export interface SidebarProjectSnapshot extends Project {
+  /** Display-only Desktop membership group; no project creation/deletion actions. */
+  desktopHistoryGroup?: true;
   projectKey: string;
   displayName: string;
   groupedProjectCount: number;

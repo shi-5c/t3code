@@ -1,4 +1,8 @@
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
+import {
+  sharedNativeBindingUnavailableReason,
+  threadCreationUnavailableReason,
+} from "../codexDesktop/threadCreation.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -18,8 +22,10 @@ import {
   ProjectId,
   type RunId,
   type RuntimeMode,
+  type ThreadType,
   type ScheduledTaskId,
   ThreadId,
+  threadTypeOf,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -44,6 +50,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
@@ -78,6 +85,7 @@ export interface ThreadLaunchInitialMessage {
 }
 
 export interface ThreadLaunchInput {
+  readonly threadType?: ThreadType;
   readonly commandId: CommandId;
   readonly threadId?: ThreadId;
   readonly reuseExistingThread?: boolean;
@@ -209,6 +217,7 @@ const make = Effect.gen(function* () {
   const git = yield* GitWorkflow.GitWorkflowService;
   const setupScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+  const adapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
@@ -242,6 +251,18 @@ const make = Effect.gen(function* () {
     const projection = yield* threads
       .getThreadRecords(threadId, ["runs"])
       .pipe(Effect.mapError(mapError(input, "update-thread", threadId)));
+    if (
+      input.threadType !== undefined &&
+      input.threadType !== (projection.thread.threadType ?? "t3")
+    ) {
+      return yield* mapError(
+        input,
+        "update-thread",
+        threadId,
+      )(
+        "An existing conversation keeps its type. Create a new conversation to choose another type.",
+      );
+    }
     if (
       projection.thread.projectId !== input.projectId ||
       projection.thread.archivedAt !== null ||
@@ -863,6 +884,70 @@ const make = Effect.gen(function* () {
       }
 
       const launchReceipt = yield* readReceipt(input, input.commandId);
+      let threadType = input.threadType ?? project.defaultThreadType ?? "t3";
+      if (Option.isSome(launchReceipt) && launchReceipt.value.status === "accepted") {
+        const existing = yield* threads
+          .getThreadShell(launchReceipt.value.threadId)
+          .pipe(Effect.mapError(mapError(input, "create-thread")));
+        threadType = existing?.threadType ?? "t3";
+      } else if (input.reuseExistingThread !== true) {
+        const metadata = adapters.getMetadata
+          ? yield* adapters
+              .getMetadata(input.modelSelection.instanceId)
+              .pipe(Effect.mapError(mapError(input, "create-thread")))
+          : yield* adapters.get(input.modelSelection.instanceId).pipe(
+              Effect.map((adapter) => ({
+                driver: adapter.driver,
+                enabled: false,
+                available: false,
+              })),
+              Effect.mapError(mapError(input, "create-thread")),
+            );
+        const unavailable = threadCreationUnavailableReason(
+          threadType,
+          input.modelSelection.instanceId,
+          metadata.driver,
+          metadata.enabled && metadata.available === true,
+        );
+        if (unavailable) return yield* mapError(input, "create-thread")(unavailable);
+      }
+      const replayThreadId =
+        Option.isSome(launchReceipt) && launchReceipt.value.status === "accepted"
+          ? launchReceipt.value.threadId
+          : input.reuseExistingThread
+            ? input.threadId
+            : undefined;
+      if (replayThreadId) {
+        const existing = yield* threads
+          .getThreadProjection(replayThreadId)
+          .pipe(Effect.mapError(mapError(input, "create-thread")));
+        const bindingError = sharedNativeBindingUnavailableReason(
+          existing.thread,
+          existing.providerThreads,
+          input.modelSelection.instanceId,
+        );
+        if (bindingError) return yield* mapError(input, "create-thread")(bindingError);
+        if (
+          threadTypeOf(existing.thread) === "codex-shared" &&
+          !existing.providerThreads.some(
+            (row) =>
+              row.id === existing.thread.activeProviderThreadId && row.nativeThreadRef?.nativeId,
+          )
+        ) {
+          const metadata = adapters.getMetadata
+            ? yield* adapters
+                .getMetadata(input.modelSelection.instanceId)
+                .pipe(Effect.mapError(mapError(input, "create-thread")))
+            : undefined;
+          const unavailable = threadCreationUnavailableReason(
+            "codex-shared",
+            input.modelSelection.instanceId,
+            metadata?.driver,
+            metadata?.enabled && metadata.available === true,
+          );
+          if (unavailable) return yield* mapError(input, "create-thread")(unavailable);
+        }
+      }
       yield* threads.assertProviderInstanceEnabled({
         projectId: input.projectId,
         commandId: input.commandId,
@@ -934,6 +1019,7 @@ const make = Effect.gen(function* () {
             : threads.dispatch({
                 type: "thread.create",
                 commandId: input.commandId,
+                threadType,
                 threadId: candidateThreadId,
                 projectId: input.projectId,
                 title: input.title,

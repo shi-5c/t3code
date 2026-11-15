@@ -1,3 +1,4 @@
+import { ThreadType } from "./threadType.ts";
 import * as Schema from "effect/Schema";
 
 import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -47,6 +48,7 @@ export const ProjectCloneListEvent = Schema.Array(ProjectCloneSnapshot);
 export type ProjectCloneListEvent = typeof ProjectCloneListEvent.Type;
 
 export const ProjectCloneStartInput = Schema.Struct({
+  defaultThreadType: Schema.optionalKey(ThreadType),
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
   createdAt: IsoDateTime,

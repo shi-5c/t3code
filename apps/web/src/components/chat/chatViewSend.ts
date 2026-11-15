@@ -31,6 +31,7 @@ import {
 import { ATTACHMENT_ONLY_BOOTSTRAP_PROMPT } from "@t3tools/shared/composerContextReferences";
 import { createModelSelection } from "@t3tools/shared/model";
 import type { ProviderInstanceEntry } from "../../providerInstances";
+import { getSharedCodexModelBlockReason } from "../../providerModels";
 import { getComposerPromptInjectionState, getComposerProviderState } from "./composerProviderState";
 import {
   formatOutgoingPrompt,
@@ -293,13 +294,16 @@ export function resolveMultipleModelTargets(input: {
     if (!provider?.enabled || !provider.isAvailable || provider.status !== "ready") {
       return { error: `Provider for ${selection.model} is unavailable.` };
     }
-    const providerBlockReason = getAntigravitySendBlockReason(provider.snapshot, selection.model);
+    const providerBlockReason =
+      getSharedCodexModelBlockReason(provider.snapshot, selection.model) ??
+      getAntigravitySendBlockReason(provider.snapshot, selection.model);
     if (providerBlockReason) return { error: providerBlockReason };
     const providerState = getComposerProviderState({
       provider: provider.driverKind,
       model: selection.model,
       models: provider.models,
       modelOptions: selection.options,
+      codexDesktopCatalog: provider.snapshot.codexDesktopCatalog,
       promptInjectionState: getComposerPromptInjectionState(messageText),
     });
     return {

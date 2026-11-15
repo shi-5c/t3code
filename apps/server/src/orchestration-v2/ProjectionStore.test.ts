@@ -844,6 +844,54 @@ it.effect("record reads filter notification sources without dropping matching me
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("preserves shared identity across detail, list and archived shell reads", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    for (const [suffix, instanceId, explicit, expected] of [
+      ["legacy-shared", "codex-desktop", undefined, "codex-shared"],
+      ["legacy-local", "codex", undefined, "t3"],
+      ["explicit-local", "codex", "t3", "t3"],
+    ] as const) {
+      const threadId = yield* addRolledBackRecoveryCandidate(suffix);
+      const initial = yield* store.getThreadProjection(threadId);
+      const { threadType: _type, ...thread } = initial.thread;
+      yield* store.apply({
+        id: EventId.make(`event:${suffix}:type`),
+        type: "thread.metadata-updated",
+        threadId,
+        occurredAt: initial.updatedAt,
+        payload: {
+          ...thread,
+          providerInstanceId: ProviderInstanceId.make(instanceId),
+          ...(explicit === undefined ? {} : { threadType: explicit }),
+        },
+      });
+      assert.equal((yield* store.getThreadProjection(threadId)).thread.threadType, expected);
+      assert.equal((yield* store.getThreadShell(threadId))?.threadType, expected);
+      assert.equal(
+        (yield* store.getShellSnapshot()).threads.find((t) => t.id === threadId)?.threadType,
+        expected,
+      );
+      yield* store.apply({
+        id: EventId.make(`event:${suffix}:archive`),
+        type: "thread.metadata-updated",
+        threadId,
+        occurredAt: initial.updatedAt,
+        payload: {
+          ...thread,
+          providerInstanceId: ProviderInstanceId.make(instanceId),
+          archivedAt: initial.updatedAt,
+        },
+      });
+      assert.equal(
+        (yield* store.getShellSnapshot()).archivedThreads.find((t) => t.id === threadId)
+          ?.threadType,
+        expected,
+      );
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("shells flag a latest run triggered by a provider background wake", () =>
   Effect.gen(function* () {
     const store = yield* ProjectionStore.ProjectionStoreV2;

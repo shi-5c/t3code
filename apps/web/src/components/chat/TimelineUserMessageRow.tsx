@@ -411,6 +411,7 @@ function UserMessageProjectedStatus({ row }: { row: Extract<TimelineRow, { kind:
   const status = row.projectedItem?.item.status;
   if (
     status === undefined ||
+    status === "idle" ||
     status === "completed" ||
     status === "pending" ||
     status === "waiting"

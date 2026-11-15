@@ -1,3 +1,4 @@
+import { codexSharedOwnerOf, threadTypeOf, nativeTitleHandoffState } from "@t3tools/contracts";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -44,6 +45,7 @@ import {
 } from "../observability/Metrics.ts";
 import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import { makeNativeSharedTitlePreparation } from "../project/NativeSharedTitle.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
@@ -187,6 +189,10 @@ export interface ProviderSessionManagerV2Shape {
     readonly reason: ProviderSessionReleaseReason;
     readonly detail?: string;
   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
+  readonly releaseSharedThread: (input: {
+    readonly providerSessionId: ProviderSessionId;
+    readonly threadId: ThreadId;
+  }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
   readonly detach: (input: {
     readonly providerSessionId: ProviderSessionId;
     readonly threadId: ThreadId;
@@ -224,6 +230,7 @@ export class ProviderSessionManagerV2 extends Context.Service<
 >()("t3/orchestration-v2/ProviderSessionManager/ProviderSessionManagerV2") {}
 
 interface LiveSessionEntry {
+  readonly codexSharedOwner: "native" | "desktop" | null;
   readonly attachedThreadIds: ReadonlySet<ThreadId>;
   readonly loadedProviderThreadKeyByThread: ReadonlyMap<ThreadId, string>;
   /** null marks an unknown catalog; undefined means MCP refresh is not configured. */
@@ -248,6 +255,7 @@ interface LiveSessionEntry {
 
 interface IdleThreadUnload {
   readonly providerThread: OrchestrationV2ProviderThread;
+  readonly shared: boolean;
   readonly generation: number;
   readonly fiber: Fiber.Fiber<void, never> | null;
 }
@@ -365,6 +373,7 @@ export const layerWithOptions = (
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const prepareNativeTitle = yield* makeNativeSharedTitlePreparation;
       const agentScope = yield* AgentScope;
       // Labs flag, read live: Codex per turn (its shared session outlives a toggle), Claude per query.
       // Unreadable settings keep it off.
@@ -1200,8 +1209,13 @@ export const layerWithOptions = (
             probedRuntime.hasPendingBackgroundWork === undefined
               ? false
               : yield* probedRuntime.hasPendingBackgroundWork.pipe(
-                  Effect.catchCause(() => Effect.succeed(false)),
+                  Effect.catchCause(() => Effect.succeed(null)),
                 );
+          // A failed probe cannot establish idleness, even after the pin budget expires.
+          if (hasPendingWork === null) {
+            yield* Effect.sleep(Duration.millis(idleTimeoutMs));
+            return yield* releaseIfStillIdle(input);
+          }
           if (hasPendingWork) {
             const now = yield* Clock.currentTimeMillis;
             const pinnedSinceMs = entry.pinnedSinceMs ?? now;
@@ -1235,6 +1249,20 @@ export const layerWithOptions = (
               providerSessionId: input.providerSessionId,
               pinnedForMs: now - pinnedSinceMs,
             });
+          }
+          // Session expiry must not bypass a thread retained because its state is unknown.
+          const probeThread = probedRuntime.hasPendingBackgroundWorkForThread;
+          if (probeThread !== undefined) {
+            for (const pending of entry.idleThreadUnloads.values()) {
+              const known = yield* probeThread(pending.providerThread).pipe(
+                Effect.as(true),
+                Effect.catchCause(() => Effect.succeed(false)),
+              );
+              if (!known) {
+                yield* Effect.sleep(Duration.millis(idleTimeoutMs));
+                return yield* releaseIfStillIdle(input);
+              }
+            }
           }
           // Adapter probes yield; guard busyTurns and idleGeneration atomically when removing the entry.
           yield* releaseEntry({
@@ -1615,11 +1643,19 @@ export const layerWithOptions = (
           ) {
             return;
           }
+          const shared =
+            entry.runtime.driver === "codex" &&
+            (input.providerThread.nativeMetadata?.codexShared === true ||
+              (yield* projectionStore.getThreadRecords(input.threadId, []).pipe(
+                Effect.map((records) => records.thread.threadType === "codex-shared"),
+                Effect.orElseSucceed(() => false),
+              )));
           const previous = yield* updateIdleThreadUnload(
             input.providerSessionId,
             input.threadId,
             (current) => ({
               providerThread: input.providerThread,
+              shared,
               generation: (current?.generation ?? 0) + 1,
               fiber: null,
             }),
@@ -1638,9 +1674,11 @@ export const layerWithOptions = (
           if (tracked === undefined) return;
           const [threadId, pending] = tracked;
           const generation = pending.generation + 1;
-          const fiber = yield* Effect.sleep(Duration.millis(idleTimeoutMs)).pipe(
+          const fiber = yield* Effect.sleep(
+            Duration.millis(pending.shared ? 1_000 : idleTimeoutMs),
+          ).pipe(
             Effect.andThen(unloadIdleThread({ providerSessionId, threadId, generation })),
-            Effect.forkIn(layerScope),
+            Effect.forkIn(entry.scope),
           );
           const previous = yield* updateIdleThreadUnload(providerSessionId, threadId, (current) =>
             current?.generation === pending.generation
@@ -1658,6 +1696,7 @@ export const layerWithOptions = (
           readonly providerSessionId: ProviderSessionId;
           readonly threadId: ThreadId;
           readonly generation: number;
+          readonly retry?: boolean;
         }): Effect.fn.Return<void> {
           const outcome = yield* threadAttachment.withLock(
             threadAttachmentKey(input),
@@ -1679,11 +1718,115 @@ export const layerWithOptions = (
               // Unloading kills background terminals; keep threads with pending work loaded.
               const hasPendingWork =
                 entry.runtime.hasPendingBackgroundWorkForThread === undefined
-                  ? false
+                  ? pending.shared
                   : yield* entry.runtime
                       .hasPendingBackgroundWorkForThread(pending.providerThread)
-                      .pipe(Effect.catchCause(() => Effect.succeed(false)));
-              if (hasPendingWork) return "deferred" as const;
+                      .pipe(Effect.catchCause(() => Effect.succeed(true)));
+              if (hasPendingWork)
+                return pending.shared ? ("deferred-shared" as const) : ("deferred" as const);
+              if (pending.shared) {
+                const protectedWork = yield* projectionStore
+                  .getThreadRecords(
+                    input.threadId,
+                    ["runtimeRequests", "runs", "providerThreads"],
+                    {
+                      runtimeRequestStatuses: ["pending"],
+                      runStatuses: ["preparing", "queued", "starting", "running", "waiting"],
+                    },
+                  )
+                  .pipe(
+                    Effect.map(
+                      (records) =>
+                        records.runtimeRequests.length > 0 ||
+                        records.runs.length > 0 ||
+                        records.providerThreads.some(
+                          (thread) =>
+                            thread.id === pending.providerThread.id &&
+                            (thread.pendingBackgroundTasks ?? []).length > 0,
+                        ),
+                    ),
+                    Effect.orElseSucceed(() => true),
+                  );
+                if (protectedWork) return "deferred-shared" as const;
+              }
+              const allocated = yield* idAllocator.allocate
+                .event({ threadId: input.threadId })
+                .pipe(Effect.option);
+              if (Option.isNone(allocated)) return "deferred-shared" as const;
+              const releaseGeneration = String(allocated.value);
+              const writeRelease = Effect.fn("ProviderSessionManager.writeSharedRelease")(
+                function* (state: "pending" | "ready" | "unknown") {
+                  if (!pending.shared) return true;
+                  const records = yield* projectionStore.getThreadRecords(input.threadId, [
+                    "providerThreads",
+                  ]);
+                  const current = records.providerThreads.find(
+                    (thread) => thread.id === pending.providerThread.id,
+                  );
+                  const nativeId = pending.providerThread.nativeThreadRef?.nativeId;
+                  if (
+                    !current ||
+                    !nativeId ||
+                    current.nativeThreadRef?.nativeId !== nativeId ||
+                    current.providerSessionId !== pending.providerThread.providerSessionId ||
+                    (state !== "pending" &&
+                      current.nativeMetadata?.codexSharedRelease?.generation !== releaseGeneration)
+                  )
+                    return false;
+                  const now = yield* DateTime.now;
+                  const title = current.nativeMetadata?.codexNativeTitle;
+                  const observedTitle = records.thread.codexTitleSync?.source === "saved";
+                  if (
+                    nativeTitleHandoffState({
+                      title: records.thread.title,
+                      titleVersion: records.thread.codexTitleSync?.version ?? 0,
+                      titleSource: records.thread.codexTitleSync?.source,
+                      preparation: title,
+                    }) !== "ready"
+                  )
+                    return false;
+                  const result = yield* eventSink.writeIfProviderThreadUnchanged({
+                    expected: current,
+                    ...(title?.status === "saved" || observedTitle
+                      ? {
+                          expectedSharedTitle: {
+                            title: records.thread.title,
+                            version: records.thread.codexTitleSync?.version ?? 0,
+                          },
+                        }
+                      : {}),
+                    events: [
+                      {
+                        id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
+                        type: "provider-thread.updated",
+                        threadId: input.threadId,
+                        occurredAt: now,
+                        payload: {
+                          ...current,
+                          updatedAt: now,
+                          nativeMetadata: {
+                            ...current.nativeMetadata,
+                            codexShared: true,
+                            codexSharedRelease: { state, generation: releaseGeneration, nativeId },
+                          },
+                        },
+                      },
+                    ],
+                  });
+                  return result.committed;
+                },
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Shared release state could not be persisted", { cause }).pipe(
+                    Effect.as(false),
+                  ),
+                ),
+              );
+              if (
+                pending.shared &&
+                !(yield* prepareNativeTitle(pending.providerThread, entry.runtime.nativeTitle))
+              )
+                return "deferred-shared" as const;
+              if (!(yield* writeRelease("pending"))) return "deferred-shared" as const;
               const unloading = yield* Ref.modify(sessions, (current) => {
                 const latest = current.get(key);
                 if (
@@ -1707,8 +1850,12 @@ export const layerWithOptions = (
                 return [true, updated] as const;
               });
               if (!unloading) return "skipped" as const;
-              yield* unloadThread({ providerThread: pending.providerThread }).pipe(
-                Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
+              yield* unloadThread({
+                providerThread: pending.providerThread,
+                ...(pending.shared ? { confirmRelease: true } : {}),
+              }).pipe(
+                Effect.timeout(pending.shared ? 95_000 : UNLOAD_THREAD_TIMEOUT_MS),
+                Effect.onExit((exit) => writeRelease(Exit.isSuccess(exit) ? "ready" : "unknown")),
                 Effect.tap(() =>
                   Ref.update(sessions, (current) => {
                     const latest = current.get(key);
@@ -1731,8 +1878,10 @@ export const layerWithOptions = (
             }),
           );
           // Wait outside the lock so the next attach is not blocked.
-          if (outcome === "deferred") {
-            yield* Effect.sleep(Duration.millis(idleTimeoutMs));
+          if (input.retry !== false && (outcome === "deferred" || outcome === "deferred-shared")) {
+            yield* Effect.sleep(
+              Duration.millis(outcome === "deferred-shared" ? 1_000 : idleTimeoutMs),
+            );
             return yield* unloadIdleThread(input);
           }
         },
@@ -2406,6 +2555,31 @@ export const layerWithOptions = (
           sessionOpen.withLock(
             input.providerSessionId,
             Effect.gen(function* () {
+              if (input.modelSelection.instanceId !== "codex-desktop") {
+                const legacyShared = yield* projectionStore
+                  .getThreadRecords(input.threadId, [])
+                  .pipe(
+                    Effect.map((records) => threadTypeOf(records.thread) === "codex-shared"),
+                    Effect.catchTags({
+                      ProjectionStoreThreadNotFoundError: () => Effect.succeed(false),
+                    }),
+                    Effect.mapError(
+                      (cause) =>
+                        new ProviderSessionOpenError({
+                          instanceId: input.modelSelection.instanceId,
+                          providerSessionId: input.providerSessionId,
+                          cause,
+                        }),
+                    ),
+                  );
+                if (legacyShared)
+                  return yield* new ProviderSessionOpenError({
+                    instanceId: input.modelSelection.instanceId,
+                    providerSessionId: input.providerSessionId,
+                    cause:
+                      "This development shared conversation is read-only. Use Codex Desktop Share for supported execution.",
+                  });
+              }
               const cwd = input.runtimePolicy.cwd;
               if (cwd !== null) {
                 const workspaceIsDirectory = yield* fileSystem.stat(cwd).pipe(
@@ -2419,12 +2593,63 @@ export const layerWithOptions = (
                   });
                 }
               }
+              const sharedOwner =
+                input.modelSelection.instanceId === "codex-desktop"
+                  ? yield* projectionStore.getThreadRecords(input.threadId, []).pipe(
+                      Effect.map((records) => codexSharedOwnerOf(records.thread)),
+                      Effect.mapError(
+                        (cause) =>
+                          new ProviderSessionOpenError({
+                            instanceId: input.modelSelection.instanceId,
+                            providerSessionId: input.providerSessionId,
+                            cause,
+                          }),
+                      ),
+                    )
+                  : null;
+              if (input.modelSelection.instanceId === "codex-desktop" && sharedOwner === null)
+                return yield* new ProviderSessionOpenError({
+                  instanceId: input.modelSelection.instanceId,
+                  providerSessionId: input.providerSessionId,
+                  cause: "Codex Desktop Share requires a shared conversation.",
+                });
+              if (sharedOwner === "native" && !input.initialNativeThreadId) {
+                const metadata = registry.getMetadata
+                  ? yield* registry.getMetadata(input.modelSelection.instanceId).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new ProviderSessionOpenError({
+                            instanceId: input.modelSelection.instanceId,
+                            providerSessionId: input.providerSessionId,
+                            cause,
+                          }),
+                      ),
+                    )
+                  : undefined;
+                if (!metadata?.enabled || metadata.available !== true)
+                  return yield* new ProviderSessionOpenError({
+                    instanceId: input.modelSelection.instanceId,
+                    providerSessionId: input.providerSessionId,
+                    cause:
+                      "Codex Desktop Share is disabled or unavailable; native creation is blocked.",
+                  });
+              }
               const key = sessionKey(input.providerSessionId);
               const live = (yield* Ref.get(sessions)).get(key);
               if (live !== undefined) yield* releaseForLinkedEnvironments(live);
               const existing = (yield* Ref.get(sessions)).get(key);
               if (existing !== undefined) {
                 const attached = existing.attachedThreadIds.has(input.threadId);
+                if (
+                  sharedOwner !== null &&
+                  (!attached || existing.codexSharedOwner !== sharedOwner)
+                )
+                  return yield* new ProviderSessionOpenError({
+                    instanceId: input.modelSelection.instanceId,
+                    providerSessionId: input.providerSessionId,
+                    cause:
+                      "Shared execution ownership changed; the native and Desktop sessions cannot be reused across owners.",
+                  });
                 if (!attached && !existing.supportsMultipleProviderThreads) {
                   return yield* new ProviderSessionOpenError({
                     instanceId: input.modelSelection.instanceId,
@@ -2474,6 +2699,7 @@ export const layerWithOptions = (
                   modelSelection: input.modelSelection,
                   runtimePolicy: input.runtimePolicy,
                   promptSuggestions: promptSuggestionsEnabled,
+                  ...(sharedOwner === null ? {} : { codexSharedOwner: sharedOwner }),
                   ...(input.resumeFromSession === undefined
                     ? {}
                     : { resumeFromSession: input.resumeFromSession }),
@@ -2523,6 +2749,7 @@ export const layerWithOptions = (
               >(new Map());
               const exposedRuntime = decorateRuntime(runtime, eventSubscribers);
               const entry: LiveSessionEntry = {
+                codexSharedOwner: sharedOwner,
                 attachedThreadIds: new Set([input.threadId]),
                 loadedProviderThreadKeyByThread: new Map(),
                 openedWithLinkedEnvironments,
@@ -2650,6 +2877,50 @@ export const layerWithOptions = (
             ),
         ),
         release: releaseEntry,
+        releaseSharedThread: Effect.fn("ProviderSessionManager.releaseSharedThread")(
+          function* (input) {
+            const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
+            const pending = entry?.idleThreadUnloads.get(input.threadId);
+            if (!pending?.shared)
+              return yield* new ProviderSessionReleaseError({
+                ...input,
+                reason: "manual_shutdown",
+                cause: "Shared thread is not attached.",
+              });
+            yield* cancelIdleFiber(pending.fiber);
+            const before = yield* projectionStore.getThreadRecords(input.threadId, [
+              "providerThreads",
+            ]);
+            const previous = before.providerThreads.find(
+              (thread) => thread.id === pending.providerThread.id,
+            )?.nativeMetadata?.codexSharedRelease;
+            yield* unloadIdleThread({ ...input, generation: pending.generation, retry: false });
+            const after = yield* projectionStore.getThreadRecords(input.threadId, [
+              "providerThreads",
+            ]);
+            const release = after.providerThreads.find(
+              (thread) => thread.id === pending.providerThread.id,
+            )?.nativeMetadata?.codexSharedRelease;
+            if (
+              release?.state !== "ready" ||
+              release.generation === previous?.generation ||
+              release.nativeId !== pending.providerThread.nativeThreadRef?.nativeId
+            ) {
+              return yield* new ProviderSessionReleaseError({
+                ...input,
+                reason: "manual_shutdown",
+                cause: "Native closure was not confirmed. The thread may still have active work.",
+              });
+            }
+          },
+          (effect, input) =>
+            effect.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderSessionReleaseError({ ...input, reason: "manual_shutdown", cause }),
+              ),
+            ),
+        ),
         releaseUnlessBusy: Effect.fn("ProviderSessionManager.releaseUnlessBusy")(function* (input) {
           const key = sessionKey(input.providerSessionId);
           const before = (yield* Ref.get(sessions)).get(key);

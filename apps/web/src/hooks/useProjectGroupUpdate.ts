@@ -1,4 +1,8 @@
-import { AuthOrchestrationOperateScope, type ProjectIconOverride } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  type ThreadType,
+  type ProjectIconOverride,
+} from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   mapAtomCommandResult,
@@ -17,6 +21,7 @@ import { readEnvironmentScope, useEnvironmentsWithScope } from "../state/session
 import { useOrchestrationCommand } from "../state/use-orchestration-command";
 
 export type ProjectGroupUpdate = Partial<{
+  defaultThreadType: ThreadType;
   title: string;
   faviconPath: string | null;
   projectIcon: ProjectIconOverride | null;

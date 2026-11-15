@@ -1,4 +1,6 @@
 import { OrchestrationMessageContext } from "./composerContext.ts";
+import { CodexSharedOwner, CodexTitleSync, ThreadType } from "./threadType.ts";
+import { CodexDesktopHistoryOrigin } from "./codexDesktop.ts";
 import { withRecordIdTable } from "./orchestrationV2IdTable.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -443,6 +445,10 @@ const LenientThreadOpens = Schema.NullOr(OrchestrationV2ThreadOpens).pipe(
 );
 
 export const OrchestrationV2AppThread = Schema.Struct({
+  threadType: Schema.optional(ThreadType),
+  codexSharedOwner: Schema.optional(CodexSharedOwner),
+  codexTitleSync: Schema.optional(CodexTitleSync),
+  codexDesktopHistory: Schema.optional(CodexDesktopHistoryOrigin),
   ...OrchestrationV2CreationFields,
   id: ThreadId,
   projectId: ProjectId,
@@ -1062,6 +1068,39 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
 export type OrchestrationV2PendingBackgroundTask = typeof OrchestrationV2PendingBackgroundTask.Type;
 
 export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
+  codexDesktopHandoff: Schema.optional(
+    Schema.Struct({
+      sourceProviderThreadId: ProviderThreadId,
+      baselineTurnIds: Schema.Array(Schema.String),
+    }),
+  ),
+  codexShared: Schema.optional(Schema.Literal(true)),
+  codexSharedCreationPending: Schema.optional(Schema.Literal(true)),
+  codexNativeTitle: Schema.optional(
+    Schema.Struct({
+      status: Schema.Literals([
+        "pending",
+        "saved",
+        "conflict",
+        "unknown",
+        "unverified",
+        "unavailable",
+      ]),
+      version: Schema.Number,
+      desiredTitle: Schema.String,
+      observedTitle: Schema.NullOr(Schema.String),
+      process: Schema.optional(
+        Schema.Struct({ pid: Schema.Int, hostKey: Schema.String, startedAt: Schema.String }),
+      ),
+    }),
+  ),
+  codexSharedRelease: Schema.optional(
+    Schema.Struct({
+      state: Schema.Literals(["held", "pending", "ready", "unknown"]),
+      generation: Schema.String,
+      nativeId: Schema.String,
+    }),
+  ),
   modelSelection: Schema.optional(ModelSelection),
   title: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -1519,6 +1558,13 @@ export const OrchestrationV2ModelSwitch = Schema.Struct({
 export type OrchestrationV2ModelSwitch = typeof OrchestrationV2ModelSwitch.Type;
 
 const OrchestrationV2TurnItemBaseFields = {
+  /** Saved native observations follow this local run without becoming part of its execution. */
+  nativeHistoryPosition: Schema.optionalKey(
+    Schema.Struct({
+      afterRunId: Schema.NullOr(RunId),
+      index: PositiveInt,
+    }),
+  ),
   /** Wire-only cursor for collapsed work; persisted items keep their complete history. */
   deferredWork: Schema.optionalKey(
     Schema.Struct({
@@ -2099,6 +2145,10 @@ export type OrchestrationV2LatestVisibleMessageSummary =
   typeof OrchestrationV2LatestVisibleMessageSummary.Type;
 
 export const OrchestrationV2ThreadShell = Schema.Struct({
+  threadType: Schema.optional(ThreadType),
+  codexSharedOwner: Schema.optional(CodexSharedOwner),
+  codexTitleSync: Schema.optional(CodexTitleSync),
+  codexDesktopHistory: Schema.optional(CodexDesktopHistoryOrigin),
   ...OrchestrationV2CreationFields,
   id: ThreadId,
   projectId: ProjectId,
@@ -2945,6 +2995,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("thread.create"),
+    threadType: Schema.optional(ThreadType),
     ...OrchestrationV2CreationFields,
     commandId: CommandId,
     threadId: ThreadId,
@@ -3686,6 +3737,7 @@ export const OrchestrationV2ArchivedShellSnapshot = Schema.Struct({
 export type OrchestrationV2ArchivedShellSnapshot = typeof OrchestrationV2ArchivedShellSnapshot.Type;
 
 export const OrchestrationV2ThreadLaunchInput = Schema.Struct({
+  threadType: Schema.optional(ThreadType),
   commandId: CommandId,
   creationSource: Schema.optional(OrchestrationV2CreationSource),
   threadId: Schema.optional(ThreadId),

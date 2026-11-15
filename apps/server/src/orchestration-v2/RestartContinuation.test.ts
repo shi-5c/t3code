@@ -101,6 +101,14 @@ it("requires matching saved native state for an unfinished root run", () => {
   const projection = makeProjection();
   assert.equal(restartContinuationRun(projection, now)?.id, runId);
   for (const invalid of [
+    { ...projection, thread: { ...projection.thread, threadType: "codex-shared" } },
+    {
+      ...projection,
+      thread: {
+        ...projection.thread,
+        providerInstanceId: ProviderInstanceId.make("codex-desktop"),
+      },
+    },
     { ...projection, thread: { ...projection.thread, archivedAt: {} } },
     { ...projection, thread: { ...projection.thread, deletedAt: {} } },
     {

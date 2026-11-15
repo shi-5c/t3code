@@ -1,3 +1,4 @@
+import { getSharedCodexModelBlockReason } from "../../providerModels";
 import { useLegendListRef } from "~/hooks/useLegendListRef";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
@@ -457,12 +458,17 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     });
   };
 
+  const modelDisabledReason = (instanceId: ProviderInstanceId, model: string) =>
+    getSharedCodexModelBlockReason(entryByInstanceId.get(instanceId)?.snapshot, model) ??
+    getModelDisabledReason?.(instanceId, model) ??
+    null;
+
   const handleModelSelect = (
     modelSlug: string,
     instanceId: ProviderInstanceId,
     additive = false,
   ): string | null => {
-    if (getModelDisabledReason?.(instanceId, modelSlug)) {
+    if (modelDisabledReason(instanceId, modelSlug)) {
       return null;
     }
     const options = modelOptionsByInstance.get(instanceId);
@@ -711,7 +717,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
   });
 
   const modelJumpModelKeys = visibleModels
-    .filter((model) => !getModelDisabledReason?.(model.instanceId, model.slug))
+    .filter((model) => !modelDisabledReason(model.instanceId, model.slug))
     .slice(0, MODEL_PICKER_JUMP_KEYBINDING_COMMANDS.length)
     .map((model) => modelPickerModelKey(model.instanceId, model.slug));
   const allItemKeys = ((): string[] => [
@@ -897,6 +903,16 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
               showSidebar && "border-l border-border/70",
             )}
           >
+            {instanceEntries.find((entry) => entry.instanceId === props.activeInstanceId)?.snapshot
+              .codexDesktopCatalog ? (
+              <p
+                className="shrink-0 border-b px-3 py-2 text-xs text-muted-foreground"
+                role="status"
+              >
+                Desktop catalog unavailable. These are T3 model candidates; Desktop account access
+                and freshness are unverified.
+              </p>
+            ) : null}
             <ComboboxSearchInput
               ref={searchInputRef}
               placeholder="Search models..."
@@ -1009,8 +1025,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                 if (!model) {
                   return null;
                 }
-                const disabledReason =
-                  getModelDisabledReason?.(model.instanceId, model.slug) ?? null;
+                const disabledReason = modelDisabledReason(model.instanceId, model.slug);
                 return (
                   <ModelListRow
                     key={modelKey}

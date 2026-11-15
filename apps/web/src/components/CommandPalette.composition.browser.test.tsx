@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vite-plus/test";
+import "~/index.css";
 import { page, userEvent } from "vite-plus/test/browser";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
@@ -117,7 +118,7 @@ describe.each(["repository", "folder", "destination"] as const)("add-project %s"
     await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
     await act(() => openCommandPalette({ open: "add-project" }));
     await page.getByText(step === "folder" ? "Local folder" : "Git URL", { exact: true }).click();
-    const input = () => page.getByRole("combobox");
+    const input = () => page.getByPlaceholder(/^(?:Search|Enter|Project name)/);
     if (step === "destination") {
       await input().fill("https://example.com/team/project.git");
       await userEvent.keyboard("{Enter}");
@@ -138,9 +139,31 @@ describe.each(["repository", "folder", "destination"] as const)("add-project %s"
       await expect.element(input()).toHaveValue("/workspace/計画");
     } else {
       await userEvent.keyboard("{Enter}");
-      await expect.element(page.getByRole("combobox")).not.toBeInTheDocument();
+      await expect
+        .element(page.getByPlaceholder(/^(?:Search|Enter|Project name)/))
+        .not.toBeInTheDocument();
     }
   });
+});
+
+it.each(["back", "cancel"] as const)("resets a new project type after %s", async (action) => {
+  setup();
+  await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
+  await act(() => openCommandPalette({ open: "add-project" }));
+  await page.getByText("New project", { exact: true }).click();
+  await page.getByRole("radio", { name: "Codex shared", exact: true }).click();
+  await expect
+    .element(page.getByRole("radio", { name: "Codex shared", exact: true }))
+    .toBeChecked();
+  if (action === "back") {
+    await page.getByPlaceholder("Project name").click();
+    await userEvent.keyboard("{Backspace}");
+  } else {
+    await userEvent.keyboard("{Escape}");
+    await act(() => openCommandPalette({ open: "add-project" }));
+  }
+  await page.getByText("Local folder", { exact: true }).click();
+  await expect.element(page.getByRole("radio", { name: "T3 owned", exact: true })).toBeChecked();
 });
 
 it.each([
@@ -175,7 +198,9 @@ it.each([
     await act(() => openCommandPalette({ open: "add-project" }));
     await page.getByText(source, { exact: true }).click();
     if (keys) await userEvent.keyboard(keys);
-    await expect.element(page.getByRole("combobox")).toHaveAccessibleDescription(description);
+    await expect
+      .element(page.getByPlaceholder(/^(?:Search|Enter|Project name)/))
+      .toHaveAccessibleDescription(description);
   },
 );
 
@@ -184,7 +209,7 @@ it("keeps the caret in place when an edit briefly makes the folder path not a pa
   await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
   await act(() => openCommandPalette({ open: "add-project" }));
   await page.getByText("Local folder", { exact: true }).click();
-  const input = () => page.getByRole("combobox");
+  const input = () => page.getByPlaceholder(/^(?:Search|Enter|Project name)/);
   await input().fill("/workspace/project");
   await userEvent.keyboard("{Home}{ArrowRight}{Backspace}");
   await expect.element(input()).toHaveValue("workspace/project");
@@ -201,7 +226,7 @@ it.each([
   await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
   await act(() => openCommandPalette({ open: "add-project" }));
   await page.getByText(step.flow, { exact: true }).click();
-  const input = page.getByRole("combobox");
+  const input = page.getByPlaceholder(/^(?:Search|Enter|Project name)/);
   await input.fill(step.value);
   const submit = page.getByRole("button", { name: step.submit });
   await expect.element(submit).toBeEnabled();

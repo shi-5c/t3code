@@ -13,6 +13,8 @@ import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.t
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
+import * as NativeSharedSync from "../project/NativeSharedSync.ts";
+import * as CodexSessionHistory from "../project/CodexSessionHistory.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
@@ -57,6 +59,15 @@ import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as SharedDesktopThreads from "../codexDesktop/SharedDesktopThreads.ts";
+import * as CodexDesktop from "../codexDesktop/CodexDesktop.ts";
+import * as DesktopSyncPersistence from "../codexDesktop/DesktopSyncPersistence.ts";
+import * as DesktopHistoryLibrary from "../codexDesktop/DesktopHistoryLibrary.ts";
+import * as DesktopHistoryProjection from "../codexDesktop/DesktopHistoryProjection.ts";
+import * as NativeTitleFollow from "../codexDesktop/NativeTitleFollow.ts";
+const layerDesktopHistoryLibraryProvided = DesktopHistoryLibrary.layer.pipe(
+  Layer.provide(CodexSessionHistory.layer),
+);
 
 export const layerEventInfrastructure = Layer.mergeAll(
   OrchestrationEventStore.layer,
@@ -148,6 +159,22 @@ const layerProviderAuthServiceProvided = ProviderAuthService.layer.pipe(
   Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
 );
 
+const layerSharedDesktopThreadsProvided = SharedDesktopThreads.layer.pipe(
+  Layer.provide(layerDesktopHistoryLibraryProvided),
+  Layer.provide(
+    Layer.mergeAll(
+      layerProjectService,
+      layerEventSink,
+      ProjectionStore.layer,
+      layerProviderSessionManagerProvided,
+      ThreadCommandExecutor.layer,
+      CodexSessionHistory.layer,
+    ),
+  ),
+  Layer.provide(CodexDesktop.layer),
+  Layer.provide(DesktopSyncPersistence.layer),
+);
+
 const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -166,6 +193,7 @@ const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pip
   Layer.provide(
     Layer.mergeAll(
       layerContextHandoffServiceProvided,
+      CodexSessionHistory.layer,
       layerEventSink,
       IdAllocator.layer,
       ProjectionStore.layer,
@@ -215,6 +243,7 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerCheckpointServiceProvided,
+      CodexSessionHistory.layer,
       CommandPolicy.layer,
       layerStores,
       layerEventSink,
@@ -239,6 +268,8 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       AgentSessionScanner.layer,
+      CodexSessionHistory.layer,
+      ProjectionStore.layer,
       layerProjectService,
       layerOrchestratorProvided,
       layerEventSink,
@@ -270,6 +301,7 @@ const layerThreadLaunchProvided = ThreadLaunchService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerProjectService,
+      ProviderAdapterRegistry.layerFromProviderInstanceRegistry,
       layerProjectSetupScriptRunner,
       layerManagedProjectFoldersProvided,
       layerThreadManagementProvided,
@@ -368,7 +400,39 @@ export const layer = Layer.mergeAll(
   layerLegacyV1ThreadImporterProvided,
 );
 
+const layerDesktopHistoryProjectionProvided = DesktopHistoryProjection.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerDesktopHistoryLibraryProvided,
+      layerProjectService,
+      ProjectionStore.layer,
+      layerEventSink,
+      ThreadCommandExecutor.layer,
+    ),
+  ),
+);
+
 export const layerProduction = Layer.mergeAll(
+  NativeTitleFollow.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        layerDesktopHistoryLibraryProvided,
+        ProjectionStore.layer,
+        layerEventSink,
+        ThreadCommandExecutor.layer,
+      ),
+    ),
+  ),
+  layerDesktopHistoryLibraryProvided,
+  layerDesktopHistoryProjectionProvided,
+  NativeSharedSync.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(layerAgentSessionImporterProvided, ProjectionStore.layer).pipe(
+        Layer.provideMerge(ProjectStore.layer),
+      ),
+    ),
+  ),
+  layerSharedDesktopThreadsProvided,
   WorktreeBranchSync.layer.pipe(
     Layer.provide(Layer.merge(layerThreadManagementProvided, ProjectionStore.layer)),
   ),

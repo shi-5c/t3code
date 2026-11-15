@@ -1,3 +1,4 @@
+import { ProviderDriverKind, threadTypeOf } from "@t3tools/contracts";
 import { useAtomMount } from "@effect/atom-react";
 import { asLaunchingThread } from "@t3tools/client-runtime/state/thread-inbox";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
@@ -112,7 +113,11 @@ import { ThreadSearchMatchExcerpt } from "../ThreadSearchMatch";
 import { makeWorkspaceFileDropHandlers } from "../chat/workspaceFileDrop";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 import { getTriggerDisplayModelName } from "../chat/providerIconUtils";
-import { shouldShowInstanceBadge, type ProviderInstanceEntry } from "../../providerInstances";
+import {
+  shouldShowInstanceBadge,
+  threadProviderDisplayName,
+  type ProviderInstanceEntry,
+} from "../../providerInstances";
 import { useThreadRunningTerminalIds } from "../../state/terminalSessions";
 import { InlineButton } from "../ui/button";
 import { Kbd } from "../ui/kbd";
@@ -185,6 +190,30 @@ function SidebarProviderStack(props: {
   thread: SidebarThreadSummary;
   providerEntryByInstanceId: ReadonlyMap<string, SidebarProviderEntry>;
 }) {
+  if (threadTypeOf(props.thread) === "codex-shared") {
+    return (
+      <span
+        className="inline-flex shrink-0 items-center gap-1"
+        aria-label="Shared with Codex Desktop"
+      >
+        <ProviderInstanceIcon
+          driverKind={ProviderDriverKind.make("codex")}
+          displayName={threadProviderDisplayName(props.thread, "Codex")}
+          size="compact"
+        />
+        <span className="text-3xs text-muted-foreground">Shared</span>
+        {props.thread.codexDesktopHistory ? (
+          <span className="max-w-24 truncate text-3xs text-muted-foreground">
+            {props.thread.codexDesktopHistory.membership.kind === "none"
+              ? "No project"
+              : props.thread.codexDesktopHistory.membership.kind === "assigned"
+                ? props.thread.codexDesktopHistory.membership.projectTitle || "Desktop project"
+                : "Project unknown"}
+          </span>
+        ) : null}
+      </span>
+    );
+  }
   const stack = resolveThreadProviderStack(props.thread);
   const currentInstanceId = stack[stack.length - 1]!;
   const currentEntry = props.providerEntryByInstanceId.get(currentInstanceId) ?? null;
@@ -262,6 +291,10 @@ function SidebarThreadTooltip({
   terminalProcessCount: number;
 }) {
   const driverKind = providerEntry?.driverKind ?? null;
+  const providerDisplayName = threadProviderDisplayName(
+    thread,
+    providerEntry?.displayName ?? thread.runtime?.providerName ?? modelInstanceId,
+  );
   const previousProviderNames = thread.providerInstanceHistory
     .filter((instanceId) => instanceId !== modelInstanceId)
     .map((instanceId) => providerEntryByInstanceId.get(instanceId)?.displayName ?? instanceId);
@@ -311,9 +344,7 @@ function SidebarThreadTooltip({
           <div className="flex min-w-0 items-center gap-2">
             <ProviderInstanceIcon
               driverKind={driverKind}
-              displayName={
-                providerEntry?.displayName ?? thread.runtime?.providerName ?? modelInstanceId
-              }
+              displayName={providerDisplayName}
               accentColor={providerEntry?.accentColor}
               acpRegistryAgentId={providerEntry?.acpRegistryAgentId}
               acpRegistryIconUrl={providerEntry?.acpRegistryIconUrl}
@@ -324,7 +355,7 @@ function SidebarThreadTooltip({
             />
             <div className="min-w-0 truncate text-foreground/75">
               {showInstanceBadge && providerEntry
-                ? `${modelLabel} · ${providerEntry.displayName}`
+                ? `${modelLabel} · ${providerDisplayName}`
                 : modelLabel}
             </div>
           </div>

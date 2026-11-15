@@ -62,6 +62,58 @@ const layerTest = Layer.mergeAll(
   ),
 );
 
+it.effect("rejects unsupported shared Desktop commands before creating runs or effects", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const threadId = ThreadId.make("thread:desktop-commands");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-desktop-commands"),
+      threadId,
+      projectId: ProjectId.make("project:desktop-commands"),
+      title: "Shared commands",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const current = yield* projections.getThread(threadId);
+    yield* projections.apply({
+      id: EventId.make("bind-desktop-commands"),
+      type: "thread.metadata-updated",
+      threadId,
+      occurredAt: yield* DateTime.now,
+      payload: { ...current, providerInstanceId: ProviderInstanceId.make("codex-desktop") },
+    });
+    const before = yield* projections.getThreadProjection(threadId);
+    for (const text of ["/goal pause", "/goal a test objective", "/compact", " /COMPACT "]) {
+      const commandId = CommandId.make(`desktop-command:${text}`);
+      const result = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          commandId,
+          threadId,
+          messageId: MessageId.make(`message:${text}`),
+          text,
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "start_immediately" },
+        })
+        .pipe(Effect.result);
+      assert.ok(Result.isFailure(result));
+      assert.instanceOf(result.failure, Orchestrator.OrchestratorDispatchError);
+      assert.deepEqual(yield* projections.getThreadProjection(threadId), before);
+      assert.deepEqual(yield* outbox.listByCommandId(commandId), []);
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect.each(
   (["provider.switch", "thread.model-selection.set"] as const).flatMap((type) =>
     [
@@ -645,7 +697,36 @@ it.effect(
           lastError: null,
         },
       });
-      for (const mode of ["live", "message"] as const) {
+      for (const mode of ["live", "message", "desktop"] as const) {
+        const beforeResponseThread = yield* projections.getThread(threadId);
+        if (mode === "desktop") {
+          const current = yield* projections.getThread(threadId);
+          yield* projections.apply({
+            id: EventId.make("handoff-desktop-control"),
+            type: "thread.metadata-updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              ...current,
+              threadType: "codex-shared",
+              codexSharedOwner: "desktop",
+              providerInstanceId: ProviderInstanceId.make("codex-desktop"),
+              modelSelection: {
+                ...current.modelSelection,
+                instanceId: ProviderInstanceId.make("codex-desktop"),
+              },
+            },
+          });
+          const session = (yield* projections.getThreadProviderContext(threadId))
+            .providerSessions[0]!;
+          yield* projections.apply({
+            id: EventId.make("attach-desktop-control"),
+            type: "provider-session.attached",
+            threadId,
+            occurredAt: now,
+            payload: { ...session, providerInstanceId: ProviderInstanceId.make("codex-desktop") },
+          });
+        }
         const requestId = RuntimeRequestId.make(`request:${mode}`);
         yield* projections.apply({
           id: EventId.make(`request:${mode}`),
@@ -660,7 +741,7 @@ it.effect(
             kind: "user_input",
             status: "pending",
             responseCapability:
-              mode === "live"
+              mode !== "message"
                 ? { type: "live", providerSessionId: sessionId }
                 : { type: "message" },
             createdAt: now,
@@ -756,7 +837,7 @@ it.effect(
           });
         }
         yield* orchestrator.dispatch(
-          mode === "live"
+          mode !== "message"
             ? {
                 type: "runtime-request.respond",
                 commandId: CommandId.make(`respond:${mode}`),
@@ -773,11 +854,35 @@ it.effect(
         );
         assert.equal(
           (yield* projections.getRuntimeRequest(threadId, requestId))?.status,
-          "resolved",
+          mode === "desktop" ? "pending" : "resolved",
         );
+        if (mode === "desktop")
+          yield* projections.apply({
+            id: EventId.make("restore-control-provider"),
+            type: "thread.metadata-updated",
+            threadId,
+            occurredAt: now,
+            payload: beforeResponseThread,
+          });
         const response = yield* projections.getRuntimeResponseContext(threadId, requestId);
-        assert.equal(response.node?.status, mode === "live" ? "completed" : "cancelled");
-        assert.equal(response.item?.status, mode === "live" ? "completed" : "cancelled");
+        assert.equal(
+          response.node?.status,
+          mode === "desktop" ? "waiting" : mode === "live" ? "completed" : "cancelled",
+        );
+        assert.equal(
+          response.item?.status,
+          mode === "desktop" ? "waiting" : mode === "live" ? "completed" : "cancelled",
+        );
+        if (mode === "desktop") {
+          assert.isUndefined(response.request?.answers);
+          assert.isUndefined(response.request?.decision);
+          if (response.item?.type === "user_input_request")
+            assert.isUndefined(response.item.questionAnswer);
+          assert.equal(
+            (yield* outbox.listByCommandId(CommandId.make(`respond:${mode}`))).length,
+            1,
+          );
+        }
         if (mode === "live") {
           assert.isNull((yield* projections.getThread(threadId)).snoozedUntil);
           assert.isNull((yield* projections.getThread(threadId)).snoozedAt);

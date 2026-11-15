@@ -1,5 +1,6 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as CodexSessionHistory from "../project/CodexSessionHistory.ts";
 import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
@@ -67,9 +68,9 @@ const normalize = (target: string) => {
   }
   return `/${parts.join("/")}`;
 };
-const layerWorktreeLocation = (worktreesDir = managedWorktreesDir) =>
+const layerWorktreeLocation = (worktreesDir = managedWorktreesDir, hostPath?: Path.Path) =>
   Layer.mergeAll(
-    Path.layer,
+    hostPath === undefined ? Path.layer : Layer.succeed(Path.Path, hostPath),
     Layer.mock(ServerConfig.ServerConfig)({ worktreesDir } as ServerConfig.ServerConfig["Service"]),
     ServerSettings.layerTest(),
   );
@@ -134,6 +135,10 @@ function startWithMissingWorktree(
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.succeed(CodexSessionHistory.CodexSessionHistory, {
+          read: ({ nativeThreadId }) =>
+            Effect.succeed({ nativeThreadId, messages: [], omittedItemTypes: [] }),
+        }),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
@@ -275,6 +280,7 @@ function makeLocalCommandHarness(input: {
   readonly workspaceRoot?: string;
   readonly gitWorkflow?: GitWorkflow.GitWorkflowService["Service"];
   readonly fileSystem?: FileSystem.FileSystem;
+  readonly hostPath?: Path.Path;
   readonly previousNativeSession?: boolean;
   readonly previousMessages?: ReadonlyArray<string>;
   readonly logoutFailure?: string;
@@ -282,6 +288,8 @@ function makeLocalCommandHarness(input: {
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
   readonly resumeFailure?: ProviderAdapter.ProviderAdapterV2Error;
+  readonly threadType?: "t3" | "codex-shared";
+  readonly nativeHistory?: CodexSessionHistory.CodexSessionHistory["Service"]["read"];
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -316,7 +324,9 @@ function makeLocalCommandHarness(input: {
   const providerSessionId = ProviderSessionId.make("new-provider-session");
   const oldProviderThreadId = ProviderThreadId.make("existing-native-provider-thread");
   const oldInstanceId = ProviderInstanceId.make("antigravity-personal");
-  const newInstanceId = ProviderInstanceId.make("codex-personal");
+  const newInstanceId = ProviderInstanceId.make(
+    input.threadType === "codex-shared" ? "codex-desktop" : "codex-personal",
+  );
   const checkpointScopeId = CheckpointScopeId.make("scope-native-account-command");
   const messageId = MessageId.make("message-native-account-command");
   const run: OrchestrationV2ThreadProjection["runs"][number] = {
@@ -369,9 +379,15 @@ function makeLocalCommandHarness(input: {
   };
   let projection: OrchestrationV2ThreadProjection = {
     thread: {
+      ...(input.threadType === undefined
+        ? {}
+        : { threadType: input.threadType, codexSharedOwner: "native" }),
       id: threadId,
       activeProviderThreadId: providerThreadId,
       projectId: ProjectId.make("project-native-account-command"),
+      providerInstanceId: newInstanceId,
+      archivedAt: null,
+      deletedAt: null,
       branch: input.worktreePath === undefined ? null : "feature/restore",
       worktreePath: input.worktreePath ?? null,
       lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
@@ -934,6 +950,12 @@ function makeLocalCommandHarness(input: {
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.succeed(CodexSessionHistory.CodexSessionHistory, {
+          read:
+            input.nativeHistory ??
+            (({ nativeThreadId }) =>
+              Effect.succeed({ nativeThreadId, messages: [], omittedItemTypes: [] })),
+        }),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: (handoff) =>
             input.sideChat?.nativeForkFrom === undefined
@@ -949,7 +971,20 @@ function makeLocalCommandHarness(input: {
                 }),
         }),
         Layer.mock(EventSink.EventSinkV2)({
+          withProviderBatch: (effect) => effect,
           writeIfRunCurrent,
+          writeIfProviderThreadUnchanged: ({ expected, events: incoming }) =>
+            Effect.sync(() => {
+              const current = projection.providerThreads.find((value) => value.id === expected.id);
+              if (JSON.stringify(current) !== JSON.stringify(expected))
+                return { committed: false, storedEvents: [] };
+              for (const event of incoming) {
+                expect(isDomainEvent(event)).toBe(true);
+                events.push(event);
+                projection = ProjectionStore.applyToProjection(projection, event);
+              }
+              return { committed: true, storedEvents: [] };
+            }),
           write: ({ events: incoming }) =>
             Effect.sync(() => {
               for (const event of incoming) {
@@ -960,7 +995,7 @@ function makeLocalCommandHarness(input: {
             }),
         }),
         IdAllocator.layer,
-        layerWorktreeLocation(input.worktreesDir),
+        layerWorktreeLocation(input.worktreesDir, input.hostPath),
         input.fileSystem === undefined
           ? FileSystem.layerNoop({ exists: () => Effect.succeed(true) })
           : Layer.succeed(FileSystem.FileSystem, input.fileSystem),
@@ -1034,6 +1069,7 @@ function makeLocalCommandHarness(input: {
     createWorktree,
     open,
     fallbackEnsureThread,
+    ensureThread,
     writeIfRunCurrent,
     startRootRun,
     startTurn,
@@ -1057,6 +1093,47 @@ function makeLocalCommandHarness(input: {
     }).pipe(Effect.provide(layer)),
   };
 }
+
+effectIt.effect.each([
+  "unbound",
+  "creation-unknown",
+  "wrong-provider",
+  "wrong-association",
+] as const)("rejects a queued shared request before opening a provider: %s", (kind) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "queued", threadType: "codex-shared" });
+    const projection = harness.projection();
+    const instanceId = ProviderInstanceId.make(
+      kind === "unbound" ? "codex-personal" : "codex-desktop",
+    );
+    harness.setProjection({
+      ...projection,
+      thread: { ...projection.thread, providerInstanceId: instanceId },
+      runs: projection.runs.map((run) => ({
+        ...run,
+        providerInstanceId: instanceId,
+        modelSelection: {
+          ...run.modelSelection,
+          instanceId:
+            kind === "wrong-provider" ? ProviderInstanceId.make("codex-other") : instanceId,
+        },
+      })),
+      providerThreads: projection.providerThreads.map((row) => ({
+        ...row,
+        providerInstanceId: instanceId,
+        appThreadId: kind === "wrong-association" ? ThreadId.make("other") : row.appThreadId,
+        ...(kind === "creation-unknown"
+          ? { nativeMetadata: { codexSharedCreationPending: true } }
+          : {}),
+      })),
+    });
+    yield* harness.startWithRetry;
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.createWorktree).not.toHaveBeenCalled();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+  }),
+);
 
 effectIt.effect(
   "recovers the local or pushed thread tip, else the current branch, remote default, or detached HEAD",
@@ -1153,6 +1230,7 @@ effectIt.effect(
           workspaceRoot,
           worktreePath,
           worktreesDir,
+          hostPath: path,
           fileSystem,
           gitWorkflow,
           failReadsAfterRunning: true,
@@ -1207,6 +1285,7 @@ effectIt.effect(
         text: "Continue",
         worktreesDir,
         worktreePath,
+        hostPath: path,
         fileSystem,
         failReadsAfterRunning: true,
       });
@@ -1465,6 +1544,7 @@ effectIt.effect.each(["cleanup-first", "startup-first"])(
         text: "Continue",
         worktreePath,
         worktreesDir: workspaceRoot,
+        hostPath: path,
         fileSystem,
         failReadsAfterRunning: true,
       });
@@ -1797,38 +1877,69 @@ effectIt.effect("checks the run's status without loading the thread's history", 
   }),
 );
 
-effectIt.effect("fails the run instead of replacing a native thread another client holds", () =>
-  Effect.gen(function* () {
-    const detail = "This conversation is open in another Codex client.";
-    const harness = makeLocalCommandHarness({
-      text: "Continue",
-      resumeFailure: new ProviderAdapter.ProviderAdapterThreadInUseError({
-        driver: ProviderDriverKind.make("codex"),
-        providerThreadId: ProviderThreadId.make("new-provider-thread"),
-        detail,
-        cause: new Error("thread native-resume-thread already has an active writer"),
-      }),
-    });
+effectIt.effect.each(["writer", "shared-resume"] as const)(
+  "keeps the original native identity after %s failure",
+  (failure) =>
+    Effect.gen(function* () {
+      const detail = "This conversation is open in another Codex client.";
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        ...(failure === "shared-resume" ? { threadType: "codex-shared" as const } : {}),
+        resumeFailure:
+          failure === "writer"
+            ? new ProviderAdapter.ProviderAdapterThreadInUseError({
+                driver: ProviderDriverKind.make("codex"),
+                providerThreadId: ProviderThreadId.make("new-provider-thread"),
+                detail,
+                cause: new Error("thread native-resume-thread already has an active writer"),
+              })
+            : new ProviderAdapter.ProviderAdapterResumeThreadError({
+                driver: ProviderDriverKind.make("codex"),
+                providerSessionId: ProviderSessionId.make("new-provider-session"),
+                providerThreadId: ProviderThreadId.make("new-provider-thread"),
+                cause: new Error("Native resume response was lost"),
+              }),
+      });
 
-    const exit = yield* Effect.exit(harness.start);
+      const exit = yield* Effect.exit(harness.start);
 
-    expect(harness.fallbackEnsureThread).not.toHaveBeenCalled();
-    expect(exit._tag).toBe("Success");
-    expect(harness.startRootRun).not.toHaveBeenCalled();
-    const projection = harness.projection();
-    expect(projection.providerThreads.at(-1)?.nativeThreadRef?.nativeId).toBe(
-      "native-resume-thread",
-    );
-    expect(projection.contextHandoffs).toEqual([]);
-    expect(projection.runs.at(-1)).toMatchObject({ status: "failed", startedAt: null });
-    expect(projection.turnItems).toMatchObject([
-      {
-        type: "error",
-        title: "Provider turn failed to start",
-        failure: { class: "provider_error", message: detail },
-      },
-    ]);
-  }),
+      expect(harness.fallbackEnsureThread).not.toHaveBeenCalled();
+      expect(exit._tag).toBe("Success");
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      const projection = harness.projection();
+      expect(projection.providerThreads.at(-1)?.nativeThreadRef?.nativeId).toBe(
+        "native-resume-thread",
+      );
+      expect(projection.contextHandoffs).toEqual([]);
+      expect(projection.runs.at(-1)).toMatchObject({ status: "failed", startedAt: null });
+      expect(projection.turnItems).toMatchObject([
+        {
+          type: "error",
+          title: "Provider turn failed to start",
+          failure: {
+            class: "provider_error",
+            ...(failure === "writer" ? { message: detail } : {}),
+          },
+        },
+      ]);
+    }),
+);
+
+effectIt.effect(
+  "does not allocate another shared native thread after an unknown creation outcome",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "First real input",
+        threadType: "codex-shared",
+        ensureThreadFailure: "Connection lost after thread/start",
+      });
+      yield* Effect.exit(harness.startWithRetry);
+      yield* Effect.exit(harness.startWithRetry);
+      expect(harness.ensureThread).toHaveBeenCalledOnce();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().providerThreads.at(-1)?.nativeThreadRef).toBeNull();
+    }),
 );
 
 effectIt.effect("does not mistake a failed state read for a superseded run", () =>
@@ -1846,6 +1957,50 @@ effectIt.effect("does not mistake a failed state read for a superseded run", () 
     expect(startCheck._tag).toBe("ProjectionStoreReadError");
     expect(finalizeCheck._tag).toBe("ProjectionStoreReadError");
   }),
+);
+
+effectIt.effect(
+  "refreshes external history at native start after queued or internal intake, once before sending",
+  () =>
+    Effect.gen(function* () {
+      const nativeHistory = vi.fn(({ nativeThreadId }: { nativeThreadId: string }) =>
+        Effect.succeed({
+          nativeThreadId,
+          messages: [
+            {
+              turnId: "external-turn",
+              itemId: "external-answer",
+              role: "assistant" as const,
+              text: "Written while the T3 queue was paused",
+              createdAt: "2026-09-01T10:00:00.000Z",
+            },
+          ],
+          omittedItemTypes: [],
+        }),
+      );
+      const harness = makeLocalCommandHarness({
+        text: "Continue the queued request",
+        threadType: "codex-shared",
+        previousTurn: { runStatus: "completed", turnStatus: "completed" },
+        nativeHistory,
+      });
+      yield* harness.start;
+      yield* harness.start;
+      expect(nativeHistory).toHaveBeenCalledOnce();
+      expect(nativeHistory.mock.calls[0]?.[0]).toMatchObject({
+        providerInstanceId: "codex-desktop",
+        nativeThreadId: "existing-native-conversation",
+      });
+      expect(
+        harness
+          .projection()
+          .messages.some((message) => message.text === "Written while the T3 queue was paused"),
+      ).toBe(true);
+      expect(harness.startRootRun).toHaveBeenCalledOnce();
+      expect(harness.startRootRun.mock.calls[0]?.[0].providerThread.nativeThreadRef?.nativeId).toBe(
+        "existing-native-conversation",
+      );
+    }),
 );
 
 effectIt.effect(

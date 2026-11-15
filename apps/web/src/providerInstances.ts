@@ -1,8 +1,11 @@
 import { pipe } from "effect/Function";
 import {
   DEFAULT_MODEL_BY_PROVIDER,
+  CODEX_DESKTOP_CATALOG_UNAVAILABLE,
   defaultInstanceIdForDriver,
   resolveProjectProviderInstanceEnabled,
+  threadTypeOf,
+  type ThreadType,
   type ModelSelection,
   type ProjectId,
   type ProviderDriverKind,
@@ -19,6 +22,29 @@ import {
 } from "@t3tools/client-runtime/state/provider-instance-display";
 
 export { normalizeProviderAccentColor, shouldShowInstanceBadge };
+
+const SHARED_CODEX_DISPLAY_NAME = "Codex Desktop Share";
+
+export function threadProviderDisplayName(
+  thread: { readonly threadType?: ThreadType | undefined; readonly providerInstanceId: string },
+  fallback: string,
+): string {
+  return threadTypeOf(thread) === "codex-shared" ? SHARED_CODEX_DISPLAY_NAME : fallback;
+}
+
+export function sharedConversationProviders(
+  providers: ReadonlyArray<ServerProvider>,
+  sharedInstanceId: string | null,
+): ReadonlyArray<ServerProvider> {
+  if (sharedInstanceId === null) return providers;
+  return providers
+    .filter((provider) => provider.instanceId === sharedInstanceId)
+    .map((provider) => ({
+      ...provider,
+      displayName: SHARED_CODEX_DISPLAY_NAME,
+      codexDesktopCatalog: CODEX_DESKTOP_CATALOG_UNAVAILABLE,
+    }));
+}
 
 /** Placeholder for untargetable drafts. Never persist or dispatch it; disable send until replaced. */
 export const NO_PROVIDER_MODEL_SELECTION: ModelSelection = {

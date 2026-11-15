@@ -237,6 +237,21 @@ export function getAppModelOptionsForInstance(
   }
 
   const preferences = readInstanceModelPreferences(settings, entry.instanceId);
+  const sharedSelection =
+    entry.snapshot.codexDesktopCatalog && entry.driverKind === "codex"
+      ? normalizeCustomModelSlug(selectedModel)
+      : null;
+  if (
+    sharedSelection &&
+    resolveSelectableModel(entry.driverKind, sharedSelection, entry.models) === null
+  ) {
+    return [
+      ...applyInstanceModelPreferences(options, preferences).filter(
+        (option) => option.slug !== sharedSelection,
+      ),
+      { slug: sharedSelection, name: sharedSelection, isCustom: false, isUnavailable: true },
+    ];
+  }
   return appendUnavailableDynamicModelSelection(
     applyInstanceModelPreferences(options, preferences),
     entry.models,
@@ -271,6 +286,14 @@ export function resolveAppModelSelectionForInstance(
     (candidate) => candidate.instanceId === instanceId,
   );
   if (!entry) return null;
+  if (
+    resolutionOptions?.preserveUnavailableSelection &&
+    entry.driverKind === "codex" &&
+    entry.snapshot.codexDesktopCatalog
+  ) {
+    const sharedSelection = normalizeCustomModelSlug(selectedModel);
+    if (sharedSelection) return sharedSelection;
+  }
   const options = getAppModelOptionsForInstance(
     settings,
     entry,

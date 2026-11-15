@@ -2,6 +2,24 @@ import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
 
 const T3CODE_CODEX_LAUNCH_ARGS_ENV = "T3CODE_CODEX_LAUNCH_ARGS";
 
+// The fixed Desktop identity cannot safely route a new native chat through
+// unverified per-process account/profile overrides. Existing followers still work.
+export const sharedCodexNativeOverrideError = (
+  launchArgs: string,
+  environment: NodeJS.ProcessEnv,
+): string | null => {
+  if (resolveCodexLaunchArgs(launchArgs, environment))
+    return "Codex Desktop Share cannot create a native conversation with custom launch arguments. Use a separate Codex provider for this configuration, or connect an existing Desktop conversation.";
+  if (
+    Object.entries(environment).some(
+      ([name, value]) =>
+        value?.trim() && /^(OPENAI_|AZURE_OPENAI_|CODEX_API_KEY$|CHATGPT_BASE_URL$)/i.test(name),
+    )
+  )
+    return "Codex Desktop Share cannot verify this process's account or endpoint overrides. Use a separate Codex provider, or connect an existing Desktop conversation.";
+  return null;
+};
+
 export const resolveCodexLaunchArgs = (
   launchArgs?: string,
   environment: NodeJS.ProcessEnv = process.env,

@@ -1,3 +1,5 @@
+import { codexSharedOwnerOf } from "@t3tools/contracts";
+import { sharedNativeBindingUnavailableReason } from "../codexDesktop/threadCreation.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
@@ -29,6 +31,9 @@ import * as ServerConfig from "../config.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as CodexSessionHistory from "../project/CodexSessionHistory.ts";
+import { refreshSharedNativeHistory } from "../project/NativeSharedHistory.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
@@ -156,6 +161,10 @@ export const layer: Layer.Layer<
     const path = yield* Path.Path;
     const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const projects = yield* ProjectService.ProjectService;
+    const nativeHistory = Option.getOrUndefined(
+      yield* Effect.serviceOption(CodexSessionHistory.CodexSessionHistory),
+    );
+    const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
@@ -335,7 +344,7 @@ export const layer: Layer.Layer<
       readonly willRetry?: boolean;
     }) {
       const { runId } = input;
-      const projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
+      let projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
       const run = projection.runs.find((candidate) => candidate.id === runId);
       if (run === undefined) {
         return yield* new ProviderTurnStartError({ runId, cause: `Run ${runId} was not found.` });
@@ -542,6 +551,31 @@ export const layer: Layer.Layer<
           });
         },
       );
+      const sharedBindingError =
+        codexSharedOwnerOf(projection.thread) === null
+          ? null
+          : (sharedNativeBindingUnavailableReason(
+              projection.thread,
+              projection.providerThreads,
+              run.modelSelection.instanceId,
+            ) ??
+            (codexSharedOwnerOf(projection.thread) !== null &&
+            (providerThread.providerInstanceId !== run.modelSelection.instanceId ||
+              run.providerInstanceId !== run.modelSelection.instanceId ||
+              providerThread.appThreadId !== projection.thread.id ||
+              (projection.thread.activeProviderThreadId !== null &&
+                projection.thread.activeProviderThreadId !== providerThread.id))
+              ? "The queued shared request no longer matches its saved provider binding."
+              : null));
+      if (sharedBindingError) {
+        yield* settleStartFailure({
+          signal: "shared-binding-unavailable",
+          title: "Shared conversation cannot start",
+          error: new ProviderTurnStartError({ runId, cause: sharedBindingError }),
+          message: sharedBindingError,
+        });
+        return;
+      }
       if (message.attachments.length === 0 && message.text.trimStart().startsWith("/")) {
         const isEmptyCompaction =
           message.text.trim().toLowerCase() === "/compact" && !projection.hasConversation;
@@ -711,6 +745,35 @@ export const layer: Layer.Layer<
         return;
       }
       const resolvedRuntimePolicy = resolvedPolicy.success;
+      if (codexSharedOwnerOf(projection.thread) === "native") {
+        const refreshed = yield* threadDispatch
+          .withLock(
+            input.threadId,
+            Effect.gen(function* () {
+              yield* refreshSharedNativeHistory({
+                threadId: input.threadId,
+                projectId: projection.thread.projectId,
+                workspaceRoot: resolvedRuntimePolicy.cwd,
+                projections: projectionStore,
+                eventSink,
+                history: nativeHistory,
+                beforeSend: true,
+                startingRun: { id: run.id, attemptId: attempt.id },
+              });
+              return yield* projectionStore.getTurnStartContext(input.threadId, runId);
+            }),
+          )
+          .pipe(Effect.result);
+        if (refreshed._tag === "Failure") {
+          yield* settleStartFailure({
+            signal: "shared-history-refresh-failed",
+            title: "Shared history could not be refreshed",
+            error: refreshed.failure,
+          });
+          return;
+        }
+        projection = refreshed.success;
+      }
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
@@ -992,6 +1055,7 @@ export const layer: Layer.Layer<
         // retry copy after it would rank older missed requests as the newest history.
         const missedRuns = projection.runs.filter(
           (source) =>
+            projection.thread.threadType !== "codex-shared" &&
             !resumeFellBack &&
             source.ordinal < run.ordinal &&
             source.providerThreadId === providerThread.id &&
@@ -1235,18 +1299,109 @@ export const layer: Layer.Layer<
           });
           return loaded;
         }
-        if (providerThread.nativeThreadRef === null) {
-          // Pass the stored provider row for adoption; adapter-minted duplicates make activeProviderThreadId flap.
+        if (
+          projection.thread.threadType === "codex-shared" &&
+          ["pending", "unknown"].includes(
+            providerThread.nativeMetadata?.codexSharedRelease?.state ?? "",
+          )
+        ) {
           return yield* loadFromProvider(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: projection.thread.id,
+                providerThreadId: providerThread.id,
+                runId,
+                cause:
+                  "Native release has not been confirmed. Sending is blocked until the original writer is released.",
+              }),
+            ),
+          );
+        }
+        if (providerThread.nativeThreadRef === null) {
+          let creationIntent: OrchestrationV2ProviderThread | undefined;
+          if (projection.thread.threadType === "codex-shared") {
+            if (providerThread.nativeMetadata?.codexSharedCreationPending) {
+              return yield* loadFromProvider(
+                Effect.fail(
+                  new ProviderAdapter.ProviderAdapterEnsureThreadError({
+                    driver: session.driver,
+                    threadId: projection.thread.id,
+                    cause:
+                      "The native creation outcome is unknown. T3 will not create or send again automatically. Check Codex for the original conversation before reconnecting it.",
+                  }),
+                ),
+              );
+            }
+            // Commit before the non-idempotent native allocation. An interrupted or lost
+            // response leaves a durable barrier instead of allocating another native ID.
+            creationIntent = {
+              ...providerThread,
+              nativeMetadata: {
+                ...providerThread.nativeMetadata,
+                codexShared: true,
+                codexSharedCreationPending: true,
+              },
+            };
+            const creation = yield* eventSink.writeIfProviderThreadUnchanged({
+              expected: providerThread,
+              events: [
+                {
+                  id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                  type: "provider-thread.updated",
+                  threadId: projection.thread.id,
+                  occurredAt: yield* DateTime.now,
+                  payload: creationIntent,
+                },
+              ],
+            });
+            if (!creation.committed) return undefined;
+          }
+          // Pass the stored provider row for adoption; adapter-minted duplicates make activeProviderThreadId flap.
+          const created = yield* loadFromProvider(
             session.ensureThread({
               threadId: projection.thread.id,
               title: projection.thread.title,
               modelSelection: run.modelSelection,
               runtimePolicy: resolvedRuntimePolicy,
               providerSessionId,
-              existingProviderThread: providerThread,
+              existingProviderThread: creationIntent ?? providerThread,
             }),
           );
+          if (!created || !creationIntent) return created;
+          if (created.nativeThreadRef?.strength !== "strong" || !created.nativeThreadRef.nativeId) {
+            return yield* loadFromProvider(
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterEnsureThreadError({
+                  driver: session.driver,
+                  threadId: projection.thread.id,
+                  cause:
+                    "Native creation did not return a confirmed identity. The creation barrier remains in place.",
+                }),
+              ),
+            );
+          }
+          const { codexSharedCreationPending: _pendingCreation, ...createdMetadata } =
+            created.nativeMetadata ?? {};
+          const durable: OrchestrationV2ProviderThread = {
+            ...created,
+            id: providerThread.id,
+            appThreadId: projection.thread.id,
+            nativeMetadata: { ...createdMetadata, codexShared: true },
+          };
+          const saved = yield* eventSink.writeIfProviderThreadUnchanged({
+            expected: creationIntent,
+            events: [
+              {
+                id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                type: "provider-thread.updated",
+                threadId: projection.thread.id,
+                occurredAt: yield* DateTime.now,
+                payload: durable,
+              },
+            ],
+          });
+          return saved.committed ? durable : undefined;
         }
         const uncertainDelivery = projection.contextHandoffs.some(
           (handoff) =>
@@ -1289,6 +1444,20 @@ export const layer: Layer.Layer<
             Effect.catchTags({ ContextHandoffBudgetError: () => Effect.succeed(false) }),
           );
           if (fits) return resumed.success;
+          if (projection.thread.threadType === "codex-shared") {
+            return yield* loadFromProvider(
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: session.driver,
+                  threadId: projection.thread.id,
+                  providerThreadId: providerThread.id,
+                  runId,
+                  cause:
+                    "Shared conversation context must stay in its original native thread. Open it in Codex to compact or continue.",
+                }),
+              ),
+            );
+          }
           const freshThread = { ...resumed.success, nativeThreadRef: null };
           const freshContext = handoffContextForThread(freshThread);
           const { handoff } = yield* recoveryHandoff;
@@ -1331,7 +1500,8 @@ export const layer: Layer.Layer<
         // session here would silently split the conversation from it.
         if (
           resumed._tag === "Failure" &&
-          resumed.failure._tag === "ProviderAdapterThreadInUseError"
+          (resumed.failure._tag === "ProviderAdapterThreadInUseError" ||
+            projection.thread.threadType === "codex-shared")
         ) {
           return yield* loadFromProvider(Effect.fail(resumed.failure));
         }
@@ -1405,6 +1575,18 @@ export const layer: Layer.Layer<
         return replacement;
       });
       if (loadedProviderThread === undefined) return;
+      const sharedNativeId = loadedProviderThread.nativeThreadRef?.nativeId;
+      if (projection.thread.threadType === "codex-shared" && !sharedNativeId) {
+        yield* settleStartFailure({
+          signal: "shared-identity-missing",
+          title: "Shared native identity is missing",
+          error: new ProviderTurnStartError({
+            runId,
+            cause: "Codex did not confirm the original native identity.",
+          }),
+        });
+        return;
+      }
       if (!(yield* isCurrentAttemptInStatus("starting"))) {
         return;
       }
@@ -1422,6 +1604,19 @@ export const layer: Layer.Layer<
       const retryHandoff = resumedRetryHandoff ?? (yield* prepareRetryHandoff(handoffContext));
       const runningProviderThread: OrchestrationV2ProviderThread = {
         ...loadedProviderThread,
+        ...(projection.thread.threadType === "codex-shared"
+          ? {
+              nativeMetadata: {
+                ...loadedProviderThread.nativeMetadata,
+                codexShared: true as const,
+                codexSharedRelease: {
+                  state: "held" as const,
+                  generation: String(run.id),
+                  nativeId: sharedNativeId!,
+                },
+              },
+            }
+          : {}),
         contextUsage: handoffUsage,
         id: providerThread.id,
         driver: session.driver,
@@ -1743,4 +1938,4 @@ export const layer: Layer.Layer<
       ),
     });
   }),
-);
+).pipe(Layer.provide(ThreadCommandExecutor.layer));

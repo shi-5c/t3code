@@ -1,4 +1,5 @@
 import "vite-plus/test/config";
+import * as NodeModule from "node:module";
 import { defaultInclude, defineConfig } from "vite-plus";
 
 import { isDesktopRuntimeExternalDependency } from "../../scripts/lib/desktop-external-packages.ts";
@@ -113,6 +114,11 @@ export default defineConfig({
       outExtensions: () => ({ js: ".cjs" }),
       define: publicConfigDefine,
       entry: ["src/preload.ts"],
+      alias: {
+        "@clerk/electron/preload": NodeModule.createRequire(import.meta.url).resolve(
+          "@clerk/electron/preload",
+        ),
+      },
       deps: {
         // Sandboxed preloads cannot resolve imports inside ASAR; bundle Clerk's bridge.
         alwaysBundle: (id) => id === "@clerk/electron" || id.startsWith("@clerk/electron/"),

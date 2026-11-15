@@ -16,6 +16,9 @@ export const projectMutationOperation = Effect.fn("projectMutationOperation")(fu
         commandId: mutation.commandId,
         projectId: mutation.projectId,
         title: mutation.title,
+        ...(mutation.defaultThreadType === undefined
+          ? {}
+          : { defaultThreadType: mutation.defaultThreadType }),
         workspaceRoot: mutation.workspaceRoot,
         ...(mutation.createWorkspaceRootIfMissing === undefined
           ? {}
@@ -31,6 +34,9 @@ export const projectMutationOperation = Effect.fn("projectMutationOperation")(fu
         commandId: mutation.commandId,
         projectId: mutation.projectId,
         ...(mutation.title === undefined ? {} : { title: mutation.title }),
+        ...(mutation.defaultThreadType === undefined
+          ? {}
+          : { defaultThreadType: mutation.defaultThreadType }),
         ...(mutation.workspaceRoot === undefined ? {} : { workspaceRoot: mutation.workspaceRoot }),
         ...(mutation.defaultModelSelection === undefined
           ? {}

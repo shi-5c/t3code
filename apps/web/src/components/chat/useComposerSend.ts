@@ -1202,6 +1202,7 @@ export function useComposerSend(input: ComposerSendInput) {
                 ? {
                     createThread: {
                       projectId: activeProject.id,
+                      threadType: activeThread.threadType ?? "t3",
                       title,
                       modelSelection: threadCreateModelSelection,
                       runtimeMode,

@@ -5,6 +5,8 @@ import { assert, it } from "@effect/vitest";
 import {
   AuthSessionId,
   AuthSourceControlWriteScope,
+  AuthOrchestrationOperateScope,
+  ORCHESTRATION_V2_WS_METHODS,
   EnvironmentId,
   EventId,
   MessageId,
@@ -51,6 +53,9 @@ import * as AcpRegistryRuntimeCoordinator from "@t3tools/provider-acp-registry/s
 import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
 import * as AgentSessionImporter from "./project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
+import * as CodexDesktop from "./codexDesktop/CodexDesktop.ts";
+import * as SharedDesktopThreads from "./codexDesktop/SharedDesktopThreads.ts";
+import * as DesktopHistoryLibrary from "./codexDesktop/DesktopHistoryLibrary.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as AntigravityInstallation from "./provider/AntigravityInstallation.ts";
 import * as ProviderInstallation from "./provider/providerInstallation.ts";
@@ -772,6 +777,9 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
 
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
+  Layer.mock(SharedDesktopThreads.SharedDesktopThreads)({}),
+  Layer.mock(CodexDesktop.CodexDesktop)({}),
+  Layer.mock(DesktopHistoryLibrary.DesktopHistoryLibrary)({}),
   Layer.mock(DocumentText.DocumentText)({}),
   Layer.mock(ServerSecretStore.ServerSecretStore)({}),
   Layer.mock(WorkspacePaths.WorkspacePaths)({}),
@@ -864,6 +872,92 @@ const layerConfigSources = Layer.mergeAll(
     ),
   ),
   Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+);
+
+it.effect("rejects forged native identity and release metadata at the client RPC boundary", () =>
+  Effect.gen(function* () {
+    const exits = yield* Queue.unbounded<string>();
+    const services = Layer.mergeAll(
+      layerUnusedConfigRpcServices,
+      Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+      Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+      Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+      Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+      Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),
+      Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+      Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+      Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+    );
+    const server = yield* RpcServer.makeNoSerialization(WsRpcGroup, {
+      ...WS_RPC_SERVER_OPTIONS,
+      onFromServer: (response) =>
+        response._tag === "Exit" ? Queue.offer(exits, JSON.stringify(response.exit)) : Effect.void,
+    }).pipe(
+      Effect.provide(
+        layerWsRpc(
+          {
+            sessionId: AuthSessionId.make("shared-forgery-test"),
+            subject: "test",
+            method: "browser-session-cookie",
+            scopes: [AuthOrchestrationOperateScope],
+          },
+          {},
+          yield* ServerBrowser.ServerBrowser,
+          () => Effect.void,
+          { secretReferences: true },
+        ).pipe(
+          Layer.provide(services),
+          Layer.merge(RpcAuthorization.layer([AuthOrchestrationOperateScope])),
+        ),
+      ),
+    );
+    for (const project of ["project-one", "project-two"]) {
+      yield* server.write(0, {
+        _tag: "Request",
+        id: RpcMessage.RequestId(project),
+        tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+        payload: {
+          type: "thread.create",
+          commandId: `create:${project}`,
+          threadId: `forged:${project}`,
+          projectId: project,
+          title: "Forged owner",
+          threadType: "codex-shared",
+          codexSharedOwner: "native",
+          createdBy: "system",
+          creationSource: "server",
+          modelSelection: { instanceId: "codex-desktop", model: "fixture" },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          importedNativeThread: {
+            ref: { driver: "codex", nativeId: "somebody-elses-native-id", strength: "strong" },
+            metadata: {
+              codexShared: true,
+              codexSharedRelease: {
+                state: "ready",
+                nativeId: "somebody-elses-native-id",
+                generation: "forged",
+              },
+            },
+          },
+        },
+        headers: Headers.empty,
+      });
+      assert.include(yield* Queue.take(exits), "verified import or Desktop connection flow");
+    }
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.fresh(layerConfigSources),
+        Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+        Layer.mock(ServerBrowser.ServerBrowser)({}),
+      ),
+    ),
+    Effect.scoped,
+  ),
 );
 
 it.effect.each([

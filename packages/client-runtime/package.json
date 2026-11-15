@@ -159,6 +159,10 @@
       "types": "./src/state/assets.ts",
       "default": "./src/state/assets.ts"
     },
+    "./state/codex-desktop": {
+      "types": "./src/state/codexDesktop.ts",
+      "default": "./src/state/codexDesktop.ts"
+    },
     "./state/attachments": {
       "types": "./src/state/attachments.ts",
       "default": "./src/state/attachments.ts"

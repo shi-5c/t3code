@@ -69,6 +69,37 @@ describe("ElectronShell", () => {
     }).pipe(Effect.provide(ElectronShell.layer)),
   );
 
+  it.effect("opens only an existing local Codex thread without prompt or wake parameters", () =>
+    Effect.gen(function* () {
+      openExternalMock.mockResolvedValue(undefined);
+      const url = "codex://threads/00000000-0000-4000-8000-000000000001";
+      const electronShell = yield* ElectronShell.ElectronShell;
+      const urls = [
+        url,
+        `${url}?prompt=send`,
+        `${url}#send`,
+        `${url}/extra`,
+        "codex://threads/new",
+        "codex://threads/wake?id=test",
+        url.replace("threads/", "user@threads/"),
+        url.replace("threads/", "threads:443/"),
+        "codex://threads/not-a-thread",
+      ];
+      assert.deepEqual(yield* Effect.forEach(urls, (value) => electronShell.openExternal(value)), [
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      assert.deepEqual(openExternalMock.mock.calls, [[url]]);
+    }).pipe(Effect.provide(ElectronShell.layer)),
+  );
+
   it.effect("opens local editor file deep links", () =>
     Effect.gen(function* () {
       openExternalMock.mockResolvedValue(undefined);

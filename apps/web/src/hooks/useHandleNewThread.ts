@@ -3,7 +3,13 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
-import { DEFAULT_SERVER_SETTINGS, type ScopedProjectRef, type ThreadId } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  CODEX_SHARED_INSTANCE_ID,
+  type ScopedProjectRef,
+  type ThreadId,
+  type ThreadType,
+} from "@t3tools/contracts";
 import { type AnyRouter, useRouter } from "@tanstack/react-router";
 import {
   composerDraftHasUserContent,
@@ -23,7 +29,7 @@ import {
 import { resolveNewThreadEnvMode, resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   readProject,
-  readProjects,
+  waitForProject,
   readThreadShell,
   readThreadShells,
   useProjects,
@@ -90,7 +96,7 @@ export function createNewThreadHandler(router: AnyRouter) {
     return resolveThreadRouteTarget(currentRouteParams);
   };
 
-  return (
+  return async (
     projectRef: ScopedProjectRef,
     options?: {
       branch?: string | null;
@@ -98,11 +104,33 @@ export function createNewThreadHandler(router: AnyRouter) {
       envMode?: DraftThreadEnvMode;
       startFromOrigin?: boolean;
       replace?: boolean;
+      threadType?: ThreadType;
       /** Composer text for the draft, set before it shows. A draft with user text keeps it. */
       prompt?: string;
     },
   ): Promise<{ draftId: DraftId; threadId: ThreadId } | null> => {
-    const projects = readProjects();
+    const requestingRouteHref = router.state.location.href;
+    const routeChangedSinceRequest = () => router.state.location.href !== requestingRouteHref;
+    const requestedRouteTarget = getCurrentRouteTarget();
+    const requestedDraft =
+      requestedRouteTarget?.kind === "draft"
+        ? useComposerDraftStore.getState().getDraftSession(requestedRouteTarget.draftId)
+        : null;
+    const requestedDraftType = requestedDraft?.threadType ?? "t3";
+    let project = readProject(projectRef);
+    if (project === null) {
+      await waitForProject(projectRef, 3_000);
+      if (routeChangedSinceRequest()) return null;
+      if (requestedRouteTarget?.kind === "draft" && requestedDraft) {
+        const currentDraft = useComposerDraftStore
+          .getState()
+          .getDraftSession(requestedRouteTarget.draftId);
+        if (!currentDraft || (currentDraft.threadType ?? "t3") !== requestedDraftType) return null;
+      }
+      project = readProject(projectRef);
+      if (project === null)
+        throw new Error("The project is no longer available. Retry opening it.");
+    }
     const projectGroupingSettings = selectProjectGroupingSettings(getClientSettings());
     // Read at call time; status pushes replace the config map and would recreate every sidebar handler.
     const environmentServerConfigs = appAtomRegistry.get(environmentServerConfigsAtom);
@@ -125,8 +153,6 @@ export function createNewThreadHandler(router: AnyRouter) {
       if (composerDraftHasUserContent(getComposerDraft(draftId))) return;
       setPrompt(draftId, options.prompt);
     };
-    const requestingRouteHref = router.state.location.href;
-    const routeChangedSinceRequest = () => router.state.location.href !== requestingRouteHref;
     const currentRouteTarget = getCurrentRouteTarget();
     const carrySourceShell =
       currentRouteTarget?.kind === "server" ? readThreadShell(currentRouteTarget.threadRef) : null;
@@ -143,17 +169,27 @@ export function createNewThreadHandler(router: AnyRouter) {
     const composerModelSelection = composerActiveProvider
       ? (carrySourceComposer?.modelSelectionByProvider[composerActiveProvider] ?? null)
       : null;
-    const carryModelSelection = composerModelSelection ?? carrySourceShell?.modelSelection ?? null;
+    const sourceModelSelection = composerModelSelection ?? carrySourceShell?.modelSelection ?? null;
+    const threadType = options?.threadType ?? project?.defaultThreadType ?? "t3";
+    const availableProviders =
+      environmentServerConfigs.get(projectRef.environmentId)?.providers ?? [];
+    const scopedProviders =
+      threadType === "codex-shared"
+        ? availableProviders.filter((provider) => provider.instanceId === CODEX_SHARED_INSTANCE_ID)
+        : availableProviders;
+    const carryModelSelection =
+      threadType === "codex-shared"
+        ? sourceModelSelection?.instanceId === CODEX_SHARED_INSTANCE_ID
+          ? sourceModelSelection
+          : null
+        : sourceModelSelection?.instanceId === CODEX_SHARED_INSTANCE_ID
+          ? null
+          : sourceModelSelection;
     const carryInteractionMode =
       carrySourceComposer?.interactionMode ??
       carrySourceShell?.interactionMode ??
       carrySourceDraft?.interactionMode ??
       null;
-    const project = projects.find(
-      (candidate) =>
-        candidate.id === projectRef.projectId &&
-        candidate.environmentId === projectRef.environmentId,
-    );
     const abandonedSinceRequest = () =>
       routeChangedSinceRequest() || (project !== undefined && readProject(projectRef) === null);
     const projectSettings = resolveProjectSettings(
@@ -161,19 +197,50 @@ export function createNewThreadHandler(router: AnyRouter) {
       project?.id ?? null,
       project,
     );
-    const configuredDefaultModelSelection = projectSettings.settings.defaultModelSelection ?? null;
+    const configuredSelection = projectSettings.settings.defaultModelSelection ?? null;
+    const inheritedSharedProvider =
+      configuredSelection?.instanceId === CODEX_SHARED_INSTANCE_ID ||
+      sourceModelSelection?.instanceId === CODEX_SHARED_INSTANCE_ID ||
+      useComposerDraftStore.getState().stickyActiveProvider === CODEX_SHARED_INSTANCE_ID;
+    const configuredDefaultModelSelection =
+      configuredSelection &&
+      (threadType === "codex-shared"
+        ? configuredSelection.instanceId === CODEX_SHARED_INSTANCE_ID
+        : configuredSelection.instanceId !== CODEX_SHARED_INSTANCE_ID)
+        ? configuredSelection
+        : threadType === "codex-shared"
+          ? resolveProjectDefaultProviderModelSelection(
+              (environmentServerConfigs.get(projectRef.environmentId)?.providers ?? []).filter(
+                (provider) => provider.instanceId === CODEX_SHARED_INSTANCE_ID,
+              ),
+              targetServerSettings,
+              projectRef.projectId,
+            )
+          : inheritedSharedProvider
+            ? resolveProjectDefaultProviderModelSelection(
+                (environmentServerConfigs.get(projectRef.environmentId)?.providers ?? []).filter(
+                  (provider) => provider.instanceId !== CODEX_SHARED_INSTANCE_ID,
+                ),
+                targetServerSettings,
+                projectRef.projectId,
+              )
+            : configuredSelection;
     const fallbackResolution = resolveNewThreadModelSelection({
       defaultSelection:
         configuredDefaultModelSelection ??
         (carryModelSelection || useComposerDraftStore.getState().stickyActiveProvider !== null
           ? null
           : resolveProjectDefaultProviderModelSelection(
-              environmentServerConfigs.get(projectRef.environmentId)?.providers ?? [],
+              scopedProviders,
               targetServerSettings,
               projectRef.projectId,
             )),
-      fallbackSelection: targetServerSettings.fallbackModelSelection ?? null,
-      providers: environmentServerConfigs.get(projectRef.environmentId)?.providers ?? [],
+      fallbackSelection:
+        threadType === "codex-shared" &&
+        targetServerSettings.fallbackModelSelection?.instanceId !== CODEX_SHARED_INSTANCE_ID
+          ? null
+          : (targetServerSettings.fallbackModelSelection ?? null),
+      providers: scopedProviders,
       settings: targetServerSettings,
       projectId: projectRef.projectId,
       now: Date.now(),
@@ -246,6 +313,7 @@ export function createNewThreadHandler(router: AnyRouter) {
     }
     const emptyStoredDraftThread =
       reusableStoredDraftThread &&
+      (reusableStoredDraftThread.threadType ?? "t3") === threadType &&
       !composerDraftHasUserContent(getComposerDraft(reusableStoredDraftThread.draftId))
         ? reusableStoredDraftThread
         : null;
@@ -282,7 +350,15 @@ export function createNewThreadHandler(router: AnyRouter) {
           const investedMeanwhile = composerDraftHasUserContent(
             getComposerDraft(emptyStoredDraftThread.draftId),
           );
-          if (openedMeanwhile || promotedMeanwhile || remappedMeanwhile || investedMeanwhile) {
+          const typeChangedMeanwhile =
+            (getDraftSession(emptyStoredDraftThread.draftId)?.threadType ?? "t3") !== threadType;
+          if (
+            openedMeanwhile ||
+            promotedMeanwhile ||
+            remappedMeanwhile ||
+            investedMeanwhile ||
+            typeChangedMeanwhile
+          ) {
             return null;
           }
           workspaceContext = {
@@ -350,6 +426,7 @@ export function createNewThreadHandler(router: AnyRouter) {
 
     if (
       latestActiveDraftThread &&
+      (latestActiveDraftThread.threadType ?? "t3") === threadType &&
       currentRouteTarget?.kind === "draft" &&
       latestActiveDraftThread.logicalProjectKey === logicalProjectKey &&
       latestActiveDraftThread.promotedTo == null &&
@@ -389,6 +466,7 @@ export function createNewThreadHandler(router: AnyRouter) {
       const racedDraft = getDraftSessionByLogicalProjectKey(logicalProjectKey);
       if (
         racedDraft &&
+        (racedDraft.threadType ?? "t3") === threadType &&
         racedDraft.draftId !== storedDraftThread?.draftId &&
         readThreadShell(scopeThreadRef(racedDraft.environmentId, racedDraft.threadId)) === null
       ) {
@@ -409,6 +487,7 @@ export function createNewThreadHandler(router: AnyRouter) {
       }
       setLogicalProjectDraftThreadId(logicalProjectKey, projectRef, draftId, {
         threadId,
+        threadType,
         createdAt,
         branch: options?.branch ?? null,
         worktreePath: options?.worktreePath ?? null,

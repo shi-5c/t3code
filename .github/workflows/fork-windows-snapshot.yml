@@ -1,0 +1,88 @@
+name: Fork Windows x64 snapshot
+
+on:
+  push:
+    branches: [build/windows-x64-snapshot-20261115]
+    paths:
+      - ".github/workflows/fork-windows-snapshot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-windows-snapshot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'shi-5c/t3code'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: shi-5c/t3code
+      T3CODE_HOME: ${{ runner.temp }}/t3-snapshot-home
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Select Rust 1.95.0
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Rust toolchain installation failed" }
+          "RUSTUP_TOOLCHAIN=1.95.0" >> $env:GITHUB_ENV
+          rustup run 1.95.0 rustc --version
+
+      - name: Record toolchain and source
+        shell: pwsh
+        run: |
+          node --version
+          vp --version
+          python --version
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationVersion
+          "Source: $env:GITHUB_SHA" >> $env:GITHUB_STEP_SUMMARY
+          "Unsigned Windows x64 snapshot. No release publication or installation." >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Install locked dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Check snapshot formatting
+        run: vp fmt --check .github/workflows/fork-windows-snapshot.yml docs/operations/codex-desktop-fork.md apps/desktop/src/electron/ElectronShell.test.ts apps/web/src/components/chat/NativeSharedConversation.browser.test.tsx
+
+      - name: Build unsigned Windows x64 installer
+        run: vp run dist:desktop:win:x64 --build-version 0.0.0-snapshot.${{ github.run_number }} --output-dir release-snapshot
+
+      - name: Hash installer and record provenance
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath release-snapshot -Filter *.exe -File)
+          if ($installers.Count -eq 0) { throw "No installer was produced" }
+          $lines = $installers | ForEach-Object { $h = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256; "$($h.Hash.ToLower())  $($_.Name)" }
+          $lines | Set-Content -LiteralPath release-snapshot/SHA256SUMS.txt -Encoding utf8
+          @("Source: $env:GITHUB_SHA", "Run: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID", "Signing: unsigned", "Target: Windows x64", "Rust: 1.95.0") | Set-Content -LiteralPath release-snapshot/BUILD.txt -Encoding utf8
+
+      - name: Upload installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: t3-windows-x64-snapshot-${{ github.run_number }}
+          path: |
+            release-snapshot/*.exe
+            release-snapshot/SHA256SUMS.txt
+            release-snapshot/BUILD.txt
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

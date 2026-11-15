@@ -175,7 +175,6 @@ import {
 import {
   applySidebarThreadDrop,
   filterSidebarV2VisibleThreads,
-  groupSidebarThreadsByProject,
   sidebarFolderExpansionKeys,
   buildBulkTitleRegenerationContextMenuItem,
   buildBulkUnpinContextMenuItem,
@@ -267,6 +266,8 @@ import {
   SidebarProjectFolderHeader,
   sidebarFolderRowId,
 } from "./sidebar/SidebarProjectFolderHeader";
+import { groupSidebarDesktopHistory } from "./codexDesktop/desktopHistoryGroups";
+import { DesktopHistorySidebar } from "./codexDesktop/DesktopSavedHistory";
 import {
   SidebarDragBoundary,
   SidebarSectionHeader,
@@ -524,7 +525,7 @@ function useSidebarThreads(input: {
   const projectFolders =
     folderGroups === null
       ? null
-      : groupSidebarThreadsByProject(folderGroups, activeThreads, keepEmpty).map((folder) => {
+      : groupSidebarDesktopHistory(folderGroups, activeThreads, keepEmpty).map((folder) => {
           const collapsed = !resolveProjectExpanded(
             projectExpandedById,
             sidebarFolderExpansionKeys(folder.group),
@@ -897,6 +898,10 @@ function readRouteThreadKey(router: AnyRouter): string | null {
 }
 
 export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReveal }) {
+  return <StandardSidebar routeReveal={routeReveal} />;
+}
+
+function StandardSidebar({ routeReveal }: { routeReveal: SidebarRouteReveal }) {
   const {
     projects,
     serverConfigs,
@@ -3455,15 +3460,27 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                         if (projectFolders !== null && item.marker === "active-placeholder") {
                           for (const folder of projectFolders) {
                             items.push(
-                              <SidebarProjectFolderHeader
-                                key={`project-folder:${folder.group.projectKey}`}
-                                group={folder.group}
-                                collapsed={folder.collapsed}
-                                hiddenThreads={folder.hiddenThreads}
-                                onToggle={toggleProjectFolder}
-                                onNewThread={startThreadInProjectFolder}
-                                onContextMenu={handleProjectFolderContextMenu}
-                              />,
+                              folder.group.desktopHistoryGroup ? (
+                                <button
+                                  key={`project-folder:${folder.group.projectKey}`}
+                                  type="button"
+                                  className="flex w-full items-center px-3 py-2 text-left text-xs font-medium text-muted-foreground"
+                                  aria-expanded={!folder.collapsed}
+                                  onClick={() => toggleProjectFolder(folder.group)}
+                                >
+                                  {folder.group.displayName}
+                                </button>
+                              ) : (
+                                <SidebarProjectFolderHeader
+                                  key={`project-folder:${folder.group.projectKey}`}
+                                  group={folder.group}
+                                  collapsed={folder.collapsed}
+                                  hiddenThreads={folder.hiddenThreads}
+                                  onToggle={toggleProjectFolder}
+                                  onNewThread={startThreadInProjectFolder}
+                                  onContextMenu={handleProjectFolderContextMenu}
+                                />
+                              ),
                             );
                             for (const thread of folder.threads) {
                               items.push(
@@ -3649,6 +3666,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
             </div>
           ) : null}
         </SidebarGroup>
+        <DesktopHistorySidebar query={threadSearchQuery} />
       </SidebarContent>
       <SidebarChromeFooter />
     </>

@@ -24,6 +24,7 @@ import {
   type RuntimeMode,
   type RuntimeRequestId,
   type ThreadId,
+  type ThreadType,
   type ThreadEnvMode,
   type UploadChatAttachment,
   type GuestMessageId,
@@ -47,6 +48,7 @@ export interface CreateProjectInput extends CommandMetadata {
   readonly workspaceRoot: string;
   readonly createWorkspaceRootIfMissing?: boolean;
   readonly defaultModelSelection?: ModelSelection | null;
+  readonly defaultThreadType?: ThreadType;
   readonly scripts?: ReadonlyArray<ProjectScript>;
 }
 
@@ -55,6 +57,7 @@ export interface UpdateProjectInput extends CommandMetadata {
   readonly title?: string;
   readonly workspaceRoot?: string;
   readonly defaultModelSelection?: ModelSelection | null;
+  readonly defaultThreadType?: ThreadType;
   readonly autoPull?: boolean;
   readonly projectIcon?: ProjectIconOverride | null;
   readonly faviconPath?: string | null;
@@ -70,6 +73,7 @@ export interface DeleteProjectInput extends CommandMetadata {
 }
 
 export interface CreateThreadInput extends CommandMetadata {
+  readonly threadType?: ThreadType;
   readonly threadId: ThreadId;
   readonly projectId: ProjectId;
   readonly title: string;
@@ -147,6 +151,7 @@ export interface SetThreadInteractionModeInput extends ThreadCommandInput {
 
 interface StartThreadBootstrap {
   readonly createThread?: {
+    readonly threadType?: ThreadType;
     readonly projectId: ProjectId;
     readonly title: string;
     readonly modelSelection: ModelSelection;
@@ -320,6 +325,7 @@ const mutateProject = Effect.fn("EnvironmentCommands.mutateProject")(function* (
         readonly workspaceRoot: string;
         readonly createWorkspaceRootIfMissing?: boolean;
         readonly defaultModelSelection?: ModelSelection | null;
+        readonly defaultThreadType?: ThreadType;
         readonly scripts?: ReadonlyArray<ProjectScript>;
       }
     | {
@@ -329,6 +335,7 @@ const mutateProject = Effect.fn("EnvironmentCommands.mutateProject")(function* (
         readonly title?: string;
         readonly workspaceRoot?: string;
         readonly defaultModelSelection?: ModelSelection | null;
+        readonly defaultThreadType?: ThreadType;
         readonly scripts?: ReadonlyArray<ProjectScript>;
       }
     | {
@@ -353,6 +360,9 @@ export const createProject = Effect.fn("EnvironmentCommands.createProject")(func
     ...(input.createWorkspaceRootIfMissing === undefined
       ? {}
       : { createWorkspaceRootIfMissing: input.createWorkspaceRootIfMissing }),
+    ...(input.defaultThreadType === undefined
+      ? {}
+      : { defaultThreadType: input.defaultThreadType }),
     ...(input.defaultModelSelection === undefined
       ? {}
       : { defaultModelSelection: input.defaultModelSelection }),
@@ -369,6 +379,9 @@ export const updateProject = Effect.fn("EnvironmentCommands.updateProject")(func
     projectId: input.projectId,
     ...(input.title === undefined ? {} : { title: input.title }),
     ...(input.workspaceRoot === undefined ? {} : { workspaceRoot: input.workspaceRoot }),
+    ...(input.defaultThreadType === undefined
+      ? {}
+      : { defaultThreadType: input.defaultThreadType }),
     ...(input.defaultModelSelection === undefined
       ? {}
       : { defaultModelSelection: input.defaultModelSelection }),
@@ -400,6 +413,7 @@ export const createThread = Effect.fn("EnvironmentCommands.createThread")(functi
 ) {
   return yield* dispatch({
     type: "thread.create",
+    ...(input.threadType === undefined ? {} : { threadType: input.threadType }),
     commandId: yield* allocateCommandId(input),
     createdBy: "user",
     creationSource: input.creationSource ?? "web",
@@ -718,6 +732,7 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
       ...(bootstrap === undefined ? { reuseExistingThread: true } : {}),
       projectId: thread.projectId,
       title: input.titleSeed ?? thread.title,
+      ...(thread.threadType === undefined ? {} : { threadType: thread.threadType }),
       generateTitle: input.titleSeed !== undefined,
       modelSelection: input.modelSelection ?? thread.modelSelection,
       runtimeMode: input.runtimeMode,

@@ -896,6 +896,15 @@ it.effect("includes shared sessions and provider-owned background rosters in rec
       [preparedSessionId],
     );
     assert.equal(restartContinuationRun(preparedState, yield* DateTime.now)?.id, preparedRunId);
+    assert.isUndefined(
+      restartContinuationRun(
+        {
+          ...preparedState,
+          thread: { ...preparedState.thread, threadType: "codex-shared" },
+        },
+        yield* DateTime.now,
+      ),
+    );
     assert.deepEqual(yield* projections.getUnreadableThreadIds(), []);
     const sql = yield* SqlClient.SqlClient;
     yield* sql`

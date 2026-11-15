@@ -21,6 +21,7 @@ import { useState } from "react";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
+  threadProviderDisplayName,
   type ProviderInstanceEntry,
 } from "../providerInstances";
 import { useVisibleThreadShells } from "../state/entities";
@@ -150,9 +151,10 @@ export function useCommandPaletteThreadItems(input: {
             thread.id === activeThread?.id && thread.environmentId === activeThread.environmentId
           }
           driverKind={providerEntry?.driverKind ?? null}
-          providerDisplayName={
-            thread.runtime?.providerName ?? providerEntry?.displayName ?? modelInstanceId
-          }
+          providerDisplayName={threadProviderDisplayName(
+            thread,
+            thread.runtime?.providerName ?? providerEntry?.displayName ?? modelInstanceId,
+          )}
           acpRegistryAgentId={providerEntry?.acpRegistryAgentId}
           acpRegistryIconUrl={providerEntry?.acpRegistryIconUrl}
         />

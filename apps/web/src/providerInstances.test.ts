@@ -16,6 +16,8 @@ import {
   resolveDefaultProviderModelSelection,
   resolveSelectableProviderInstance,
   shouldShowInstanceBadge,
+  sharedConversationProviders,
+  threadProviderDisplayName,
 } from "./providerInstances";
 
 function provider(input: {
@@ -56,6 +58,53 @@ const model = (slug: string, isCustom = false, isDefault = false) => ({
   isCustom,
   ...(isDefault ? { isDefault: true } : {}),
   capabilities: {},
+});
+
+it("aliases shared picker entries without changing their instance, models or ordinary labels", () => {
+  const legacy = provider({
+    provider: ProviderDriverKind.make("codex"),
+    instanceId: "codex-project-old",
+    displayName: "Old account",
+    models: [model("luna")],
+  });
+  const other = provider({
+    provider: ProviderDriverKind.make("codex"),
+    instanceId: "codex",
+    displayName: "Work account",
+  });
+  const providers = [legacy, other];
+  const scoped = sharedConversationProviders(providers, legacy.instanceId);
+  const entries = deriveProviderInstanceEntries(scoped);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.displayName).toBe("Codex Desktop Share");
+  expect(entries[0]?.instanceId).toBe(legacy.instanceId);
+  expect(entries[0]?.models).toBe(legacy.models);
+  expect(scoped[0]).toEqual({
+    ...legacy,
+    displayName: "Codex Desktop Share",
+    codexDesktopCatalog: {
+      status: "unavailable",
+      candidateSource: "independent-probe-and-manifest",
+      ownerFreshness: "unknown",
+    },
+  });
+  expect(legacy.displayName).toBe("Old account");
+  expect(sharedConversationProviders(providers, null)).toBe(providers);
+  expect(
+    threadProviderDisplayName(
+      { threadType: "codex-shared", providerInstanceId: legacy.instanceId },
+      legacy.displayName!,
+    ),
+  ).toBe("Codex Desktop Share");
+  expect(threadProviderDisplayName({ providerInstanceId: "codex-desktop" }, "Legacy desktop")).toBe(
+    "Codex Desktop Share",
+  );
+  expect(
+    threadProviderDisplayName(
+      { threadType: "t3", providerInstanceId: legacy.instanceId },
+      legacy.displayName!,
+    ),
+  ).toBe("Old account");
 });
 
 describe("isProviderInstancePickerReady", () => {

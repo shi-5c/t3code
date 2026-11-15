@@ -15,6 +15,28 @@ const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
 });
 const DEFAULT_DRIVER_KIND = ProviderDriverKind.make("codex");
 
+export function getSharedCodexModelBlockReason(
+  provider:
+    | (Pick<ServerProvider, "driver" | "models" | "codexDesktopCatalog"> &
+        Partial<Pick<ServerProvider, "enabled" | "installed" | "status" | "availability">>)
+    | undefined,
+  model: string,
+): string | null {
+  if (
+    provider?.codexDesktopCatalog &&
+    (provider.enabled === false ||
+      provider.installed === false ||
+      (provider.status !== undefined && provider.status !== "ready") ||
+      provider.availability === "unavailable")
+  )
+    return "Codex Desktop Share is disabled or unavailable. Resolve its status before sending.";
+  return provider?.driver === "codex" &&
+    provider.codexDesktopCatalog &&
+    resolveSelectableModel(provider.driver, model, provider.models) === null
+    ? `Selected model ${model || "(empty)"} is missing from T3's candidate catalog. Your model and options are kept. Refresh the catalog or explicitly select a model before sending.`
+    : null;
+}
+
 export function formatProviderDriverKindLabel(provider: ProviderDriverKind): string {
   return provider
     .replace(/([a-z])([A-Z])/g, "$1 $2")

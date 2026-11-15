@@ -254,6 +254,13 @@ export const ServerProvider = Schema.Struct({
   availability: Schema.optional(ServerProviderAvailability),
   unavailableReason: Schema.optional(TrimmedNonEmptyString),
   models: Schema.Array(ServerProviderModel),
+  codexDesktopCatalog: Schema.optional(
+    Schema.Struct({
+      status: Schema.Literal("unavailable"),
+      candidateSource: Schema.Literal("independent-probe-and-manifest"),
+      ownerFreshness: Schema.Literal("unknown"),
+    }),
+  ),
   // Kept apart from `models` so clients that predate it never offer them.
   updateRequiredModels: Schema.optionalKey(Schema.Array(ServerProviderUpdateRequiredModel)),
   slashCommands: Schema.Array(ServerProviderSlashCommand).pipe(
@@ -267,6 +274,12 @@ export const ServerProvider = Schema.Struct({
   updateState: Schema.optionalKey(ServerProviderUpdateState),
 });
 export type ServerProvider = typeof ServerProvider.Type;
+
+export const CODEX_DESKTOP_CATALOG_UNAVAILABLE = {
+  status: "unavailable",
+  candidateSource: "independent-probe-and-manifest",
+  ownerFreshness: "unknown",
+} as const satisfies NonNullable<ServerProvider["codexDesktopCatalog"]>;
 
 export const ServerProviders = ForwardCompatibleArray(ServerProvider);
 export type ServerProviders = typeof ServerProviders.Type;

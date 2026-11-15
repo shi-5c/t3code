@@ -1,5 +1,11 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "pi"]);
@@ -50,6 +56,9 @@ export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
 
 export const AgentSessionImportInput = Schema.Struct({
   projectId: ProjectId,
+  threadId: Schema.optional(ThreadId),
+  discoverOnly: Schema.optional(Schema.Boolean),
+  reconcileRelease: Schema.optional(Schema.Boolean),
   expectedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
 });
 export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;
@@ -83,9 +92,10 @@ export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanEr
   {
     operation: Schema.Literals(["read-settings", "read-projects"]),
     cause: Schema.Defect(),
+    detail: Schema.optional(Schema.String),
   },
 ) {
   override get message(): string {
-    return `Failed to scan agent sessions during ${this.operation}.`;
+    return this.detail ?? `Failed to scan agent sessions during ${this.operation}.`;
   }
 }

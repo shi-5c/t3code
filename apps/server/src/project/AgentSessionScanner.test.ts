@@ -1123,6 +1123,42 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
   });
 
   describe("recentThreads", () => {
+    it.effect("refreshes discovery to find sessions created after the initial scan", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-refresh-claude-");
+        const codexHomePath = yield* makeTempDir("t3code-refresh-codex-");
+        const workspace = yield* makeTempDir("t3code-refresh-project-");
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          expect(yield* scanner.recentThreads(workspace).pipe(Stream.runCollect)).toEqual([]);
+          yield* writeTranscript({
+            filePath: path.join(codexHomePath, "sessions", "2026", "08", "24", "rollout-new.jsonl"),
+            contents:
+              [
+                encodeTranscriptRecord({
+                  type: "session_meta",
+                  payload: { id: "new-native", cwd: workspace },
+                }),
+                encodeTranscriptRecord({
+                  type: "event_msg",
+                  payload: { type: "user_message", message: "New conversation" },
+                }),
+              ].join("\n") + "\n",
+            mtimeMs: nowMs,
+          });
+          const refreshed = yield* scanner
+            .recentThreads(workspace, [], true)
+            .pipe(Stream.runCollect);
+          expect(refreshed).toMatchObject([
+            { _tag: "Importable", thread: { providerSessionId: "new-native" } },
+          ]);
+        }).pipe(Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })));
+      }),
+    );
+
     it.effect("imports recent Claude, Codex, and Pi sessions for the selected project only", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

@@ -59,6 +59,7 @@ export interface ThreadPendingApproval {
   readonly appName?: string;
   readonly options?: ReadonlyArray<ProviderApprovalOption>;
   readonly responseCapability: "live" | "not_resumable";
+  readonly responseUnavailableReason?: string;
   readonly supportsFeedback?: boolean;
 }
 
@@ -272,6 +273,9 @@ export function derivePendingThreadRequests(
         ? { options: item.options }
         : {}),
       responseCapability: responseCapability === "live" ? "live" : "not_resumable",
+      ...(request.responseCapability.type === "not_resumable"
+        ? { responseUnavailableReason: request.responseCapability.reason }
+        : {}),
       ...(request.responseCapability.type === "live" && request.responseCapability.supportsFeedback
         ? { supportsFeedback: true }
         : {}),

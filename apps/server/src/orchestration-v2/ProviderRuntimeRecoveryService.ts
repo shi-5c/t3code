@@ -1,3 +1,4 @@
+import { codexSharedOwnerOf } from "@t3tools/contracts";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -212,6 +213,14 @@ export const make = Effect.gen(function* () {
       continueAfterRestart: boolean,
       stoppedThisPass: ReadonlyMap<string, RecoverySession> = new Map(),
     ) {
+      if (codexSharedOwnerOf(projection.thread) === "desktop")
+        return {
+          terminalizedRuns: 0,
+          stoppedSessions: 0,
+          closedRequests: 0,
+          retiredEffects: 0,
+          cancelledEffectIds: [],
+        };
       const now = yield* DateTime.now;
       let runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
       for (const run of nonterminalRuns(projection)) {
@@ -974,6 +983,7 @@ export const make = Effect.gen(function* () {
       (threadId) =>
         Effect.gen(function* () {
           const projection = yield* projections.getRuntimeRecoveryProjection(threadId);
+          if (codexSharedOwnerOf(projection.thread) === "desktop") return;
           if (
             !resolveProjectSettings(enabled, projection.thread.projectId).settings
               .continueThreadsAfterServerUpdate

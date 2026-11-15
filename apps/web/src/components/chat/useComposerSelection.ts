@@ -18,6 +18,7 @@ import { type SetStateAction } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { toastManager } from "../ui/toast";
 import { resolveAppModelSelectionForInstance } from "../../modelSelection";
+import { getSharedCodexModelBlockReason } from "../../providerModels";
 import { resolveNewDraftStartFromOrigin } from "../../lib/chatThreadActions";
 import { type DraftThreadEnvMode, useComposerDraftStore } from "../../composerDraftStore";
 import {
@@ -125,6 +126,17 @@ export function useComposerSelection(input: ComposerSelectionInput) {
   ) => {
     if (!activeThread) return;
     const entry = providerStatuses.find((snapshot) => snapshot.instanceId === instanceId);
+    if (!entry) return;
+    const catalogBlockReason = getSharedCodexModelBlockReason(entry, model);
+    if (catalogBlockReason) {
+      toastManager.add({
+        type: "warning",
+        title: "Model unavailable",
+        description: catalogBlockReason,
+      });
+      if (options?.focusComposer !== false) scheduleComposerFocus();
+      return;
+    }
     const resolvedDriverKind = entry?.driver ?? null;
     if (
       !supportsProviderSwitchingViaHandoff &&

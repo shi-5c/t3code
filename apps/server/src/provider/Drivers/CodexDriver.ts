@@ -1,4 +1,9 @@
-import { CodexSettings, ProviderDriverKind } from "@t3tools/contracts";
+import {
+  CODEX_DESKTOP_CATALOG_UNAVAILABLE,
+  CodexSettings,
+  ProviderDriverKind,
+  TextGenerationError,
+} from "@t3tools/contracts";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import type * as Signature from "effect/crypto/Signature";
@@ -10,6 +15,7 @@ import { HttpClient } from "effect/http";
 import { ChildProcessSpawner } from "effect/process";
 
 import type * as CodexUsageHistory from "../../usage/CodexUsageHistory.ts";
+import * as TextGenerationOperations from "@t3tools/provider-core/server/textGenerationOperations";
 import { makeCodexTextGeneration } from "../../textGeneration/CodexTextGeneration.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -28,7 +34,8 @@ import {
   probeCodexSkillsForCwd,
   withCodexAppServerClient,
 } from "../CodexProvider.ts";
-import { resolveCodexLaunchArgs } from "../codexLaunchArgs.ts";
+import { resolveCodexLaunchArgs, sharedCodexNativeOverrideError } from "../codexLaunchArgs.ts";
+import { ProviderAdapterOpenSessionError } from "@t3tools/provider-core/server/ProviderAdapter";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import { applyCodexModelCatalog } from "../codexModelCatalog.ts";
@@ -58,6 +65,8 @@ import * as CodexManagedTokenBroker from "../CodexManagedTokenBroker.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { DESKTOP_INSTANCE_ID } from "../../codexDesktop/identity.ts";
+import { SharedDesktopAdapterFactory } from "../../codexDesktop/SharedDesktopAdapter.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("codex");
@@ -137,6 +146,16 @@ export const CodexDriver: ProviderDriver<
     enabled,
     config,
   }) {
+    if (
+      instanceId === DESKTOP_INSTANCE_ID &&
+      (config.setupMode === "managed" || config.shadowHomePath.trim())
+    )
+      return yield* new ProviderDriverError({
+        driver: DRIVER_KIND,
+        instanceId,
+        detail:
+          "Codex Desktop Share uses the Desktop account directly; managed accounts and auth overlays require a separate provider.",
+      });
     if (config.setupMode === "managed")
       return yield* makeManagedCodexProvider({
         instanceId,
@@ -165,6 +184,28 @@ export const CodexDriver: ProviderDriver<
         ? { ...config, homePath: environmentHome }
         : config,
     );
+    const desktopFactory = yield* SharedDesktopAdapterFactory;
+    if (instanceId === DESKTOP_INSTANCE_ID) {
+      if (!desktopFactory)
+        return yield* new ProviderDriverError({
+          driver: DRIVER_KIND,
+          instanceId,
+          detail: "Codex Desktop Share is unavailable in this server runtime.",
+        });
+      yield* desktopFactory
+        .validateHome(homeLayout.effectiveHomePath ?? homeLayout.sharedHomePath)
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER_KIND,
+                instanceId,
+                detail: cause.message,
+                cause,
+              }),
+          ),
+        );
+    }
     const continuationIdentity = codexContinuationIdentity(homeLayout);
     const stampIdentity = withInstanceIdentity({
       instanceId,
@@ -172,6 +213,7 @@ export const CodexDriver: ProviderDriver<
       displayName,
       accentColor,
       continuationGroupKey: continuationIdentity.continuationKey,
+      ...(instanceId === DESKTOP_INSTANCE_ID ? { displayName: "Codex Desktop Share" } : {}),
     });
     yield* materializeCodexShadowHome(homeLayout).pipe(
       Effect.mapError(
@@ -204,7 +246,7 @@ export const CodexDriver: ProviderDriver<
       ),
     );
 
-    const orchestrationAdapter = yield* createCodexAdapterV2(
+    const nativeOrchestrationAdapter = yield* createCodexAdapterV2(
       {
         instanceId,
         displayName,
@@ -229,6 +271,25 @@ export const CodexDriver: ProviderDriver<
       ),
     );
 
+    const orchestrationAdapter =
+      instanceId === DESKTOP_INSTANCE_ID
+        ? desktopFactory!.make(instanceId, {
+            ...nativeOrchestrationAdapter,
+            openSession: (input) => {
+              const reason = sharedCodexNativeOverrideError(config.launchArgs, processEnv);
+              return reason
+                ? Effect.fail(
+                    new ProviderAdapterOpenSessionError({
+                      driver: DRIVER_KIND,
+                      providerSessionId: input.providerSessionId,
+                      cause: reason,
+                    }),
+                  )
+                : nativeOrchestrationAdapter.openSession(input);
+            },
+          })
+        : nativeOrchestrationAdapter;
+
     // Kick the TTL-gated manifest refresh in the background and classify with the in-memory
     // manifest, so a slow or hung fetch never delays the provider check.
     const checkProvider = modelCatalog.refreshInBackground.pipe(
@@ -236,7 +297,13 @@ export const CodexDriver: ProviderDriver<
         Effect.zipWith(
           checkCodexProviderStatus(effectiveConfig, undefined, processEnv),
           currentCatalog,
-          (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
+          (draft, catalog) =>
+            stampIdentity({
+              ...applyCodexModelCatalog(draft, catalog),
+              ...(instanceId === DESKTOP_INSTANCE_ID
+                ? { slashCommands: [], codexDesktopCatalog: CODEX_DESKTOP_CATALOG_UNAVAILABLE }
+                : {}),
+            }),
           { concurrent: true },
         ),
       ),
@@ -254,7 +321,13 @@ export const CodexDriver: ProviderDriver<
         Effect.zipWith(
           makePendingCodexProvider(settings.provider),
           currentCatalog,
-          (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
+          (draft, catalog) =>
+            stampIdentity({
+              ...applyCodexModelCatalog(draft, catalog),
+              ...(instanceId === DESKTOP_INSTANCE_ID
+                ? { slashCommands: [], codexDesktopCatalog: CODEX_DESKTOP_CATALOG_UNAVAILABLE }
+                : {}),
+            }),
         ),
       checkProvider,
       enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
@@ -279,11 +352,26 @@ export const CodexDriver: ProviderDriver<
           }),
       ),
     );
-    const textGeneration = yield* makeCodexTextGeneration(
+    const nativeTextGeneration = yield* makeCodexTextGeneration(
       effectiveConfig,
       processEnv,
       snapshot.getSnapshot.pipe(Effect.map((value) => value.models)),
     );
+    const textGenerationOverride =
+      instanceId === DESKTOP_INSTANCE_ID
+        ? sharedCodexNativeOverrideError(config.launchArgs, processEnv)
+        : null;
+    const textGeneration =
+      textGenerationOverride === null
+        ? nativeTextGeneration
+        : TextGenerationOperations.fromRunner("SharedCodexTextGeneration", (request) =>
+            Effect.fail(
+              new TextGenerationError({
+                operation: request.operation,
+                detail: textGenerationOverride,
+              }),
+            ),
+          );
     const snapshotForCwd = (cwd: string) =>
       !effectiveConfig.enabled
         ? snapshot.getSnapshot

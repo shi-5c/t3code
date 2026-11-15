@@ -20,6 +20,9 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
+import * as Scope from "effect/Scope";
+import * as PubSub from "effect/PubSub";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -55,6 +58,110 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { recoverSharedNativeRelease } from "../project/NativeSharedRecovery.ts";
+import { ServerConfig } from "../config.ts";
+import * as SharedDesktopThreads from "../codexDesktop/SharedDesktopThreads.ts";
+import { CodexDesktop } from "../codexDesktop/CodexDesktop.ts";
+import { DesktopSyncPersistence } from "../codexDesktop/DesktopSyncPersistence.ts";
+import { SharedDesktopStore } from "../codexDesktop/SharedDesktopStore.ts";
+import { CodexSessionHistory } from "../project/CodexSessionHistory.ts";
+import { projectDesktopConversation } from "../codexDesktop/projection.ts";
+import { observeNativeTitle } from "../codexDesktop/sharedTitle.ts";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+
+/** Real release/attach services; native IO and the Desktop owner are isolated protocol fixtures. */
+const connectReleasedTitleFixture = Effect.fn("ProviderSessionTest.connectReleasedTitle")(
+  function* (thread: OrchestrationV2AppThread) {
+    const config = yield* ServerConfig;
+    const changed = yield* PubSub.unbounded<void>();
+    const state = {
+      title: "Old title",
+      cwd: "/workspace",
+      latestModel: "gpt-5.4",
+      threadRuntimeStatus: { type: "idle" },
+      turnHistory: { history: { isComplete: true, islands: [], entitiesByKey: {} } },
+    };
+    const snapshot = {
+      state,
+      view: {
+        conversationId: "native-thread",
+        status: "ready" as const,
+        detail: "Fixture owner",
+        epoch: "owner",
+        revision: 1,
+        ...projectDesktopConversation(state),
+      },
+    };
+    const bindings = Layer.effect(
+      DesktopSyncPersistence,
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.makeDirectory(config.stateDir, { recursive: true });
+        const store = yield* Effect.acquireRelease(
+          Effect.sync(() => new SharedDesktopStore(`${config.stateDir}/codex-desktop-sync.sqlite`)),
+          (store) => Effect.sync(() => store.close()),
+        );
+        return { get: Effect.succeed(store) };
+      }),
+    );
+    const dependencies = Layer.mergeAll(
+      bindings,
+      Layer.mock(CodexDesktop)({
+        home: Effect.succeed(config.stateDir),
+        watchCanonical: () => Stream.concat(Stream.make(snapshot), Stream.never),
+      }),
+      Layer.mock(CodexSessionHistory)({
+        read: () =>
+          Effect.succeed({
+            nativeThreadId: "native-thread",
+            turnIds: [],
+            messages: [],
+            omittedItemTypes: [],
+          }),
+      }),
+      Layer.mock(ProjectService.ProjectService)({
+        getById: () =>
+          Effect.succeedSome({
+            id: thread.projectId,
+            workspaceRoot: "/workspace",
+            archivedAt: null,
+          } as Project),
+      }),
+      Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+        subscribeChanges: PubSub.subscribe(changed),
+        getInstance: () => Effect.succeed({} as ProviderInstance),
+      }),
+      Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+        get: () =>
+          Effect.succeedSome({
+            providerSessionId: "desktop-session:native-thread",
+          } as ProviderAdapter.ProviderAdapterV2SessionRuntime),
+      }),
+      ThreadCommandExecutor.layer,
+      ServerSettings.layerTest({
+        providerInstances: {
+          [ProviderInstanceId.make("codex-desktop")]: {
+            driver: "codex",
+            enabled: true,
+            config: { setupMode: "existing", homePath: config.stateDir },
+          },
+        },
+      }),
+    );
+    const serviceLayer = SharedDesktopThreads.layer.pipe(Layer.provide(dependencies));
+    // Recreate the binding service and its private SQLite handle before connecting, retaining released projections.
+    const firstScope = yield* Scope.make();
+    yield* Layer.buildWithScope(serviceLayer, firstScope);
+    yield* Scope.close(firstScope, Exit.void);
+    const secondScope = yield* Scope.make();
+    yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void));
+    const service = Context.get(
+      yield* Layer.buildWithScope(Layer.fresh(serviceLayer), secondScope),
+      SharedDesktopThreads.SharedDesktopThreads,
+    );
+    yield* service.attachExisting(thread.id, "native-thread");
+  },
+);
 
 const layerTestDatabase = SqlitePersistence.layerMemory;
 const layerTestStores = Layer.merge(EventStore.layer, ProjectionStore.layer).pipe(
@@ -146,7 +253,10 @@ const layerPausingAttachEventSink = (pause: {
     }),
   ).pipe(Layer.provide(layerTestEventSink));
 
-const layerBeforeUnchangedWriteEventSink = (before: Ref.Ref<Effect.Effect<void>>) =>
+const layerBeforeUnchangedWriteEventSink = (
+  before: Ref.Ref<Effect.Effect<void>>,
+  onlyRelease = false,
+) =>
   Layer.effect(
     EventSink.EventSinkV2,
     Effect.gen(function* () {
@@ -154,10 +264,17 @@ const layerBeforeUnchangedWriteEventSink = (before: Ref.Ref<Effect.Effect<void>>
       return EventSink.EventSinkV2.of({
         ...delegate,
         writeIfProviderThreadUnchanged: (input) =>
-          Ref.getAndSet(before, Effect.void).pipe(
-            Effect.flatten,
-            Effect.andThen(delegate.writeIfProviderThreadUnchanged(input)),
-          ),
+          onlyRelease &&
+          !input.events.some(
+            (event) =>
+              event.type === "provider-thread.updated" &&
+              event.payload.nativeMetadata?.codexSharedRelease?.state === "pending",
+          )
+            ? delegate.writeIfProviderThreadUnchanged(input)
+            : Ref.getAndSet(before, Effect.void).pipe(
+                Effect.flatten,
+                Effect.andThen(delegate.writeIfProviderThreadUnchanged(input)),
+              ),
       });
     }),
   ).pipe(Layer.provide(layerTestEventSink));
@@ -192,11 +309,523 @@ const emptyState: TestProviderRuntimeState = {
   eventQueues: new Map(),
 };
 
+it.effect.each(["unknown", "pending", "imported", "approval", "background", "creation"] as const)(
+  "explicitly reconciles the saved native ID without a turn or a new conversation (%s)",
+  (condition) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("shared-release-recovery");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: sharedSelection.instanceId,
+        });
+        const created = yield* makeThreadCreatedEvent({ idAllocator, threadId, now });
+        const providerThread = {
+          ...makeProviderThread({ idAllocator, threadId, providerSessionId, now }),
+          providerInstanceId: sharedSelection.instanceId,
+          ...(condition === "imported" ? { providerSessionId: null } : {}),
+          nativeMetadata: {
+            codexShared: true as const,
+            ...(condition === "creation" ? { codexSharedCreationPending: true as const } : {}),
+            codexSharedRelease: {
+              state: condition === "pending" ? ("pending" as const) : ("unknown" as const),
+              generation: "previous-runtime",
+              nativeId: "native-thread",
+            },
+          },
+        };
+        const pending = yield* makePendingRuntimeRequestEvents({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          providerThread,
+          now,
+        });
+        yield* eventSink.write({
+          events: [
+            {
+              ...created,
+              payload: {
+                ...created.payload,
+                threadType: "codex-shared",
+                codexSharedOwner: "native",
+                providerInstanceId: sharedSelection.instanceId,
+                modelSelection: sharedSelection,
+              },
+            },
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: providerThread,
+            },
+            ...(condition === "approval" ? pending.events : []),
+          ],
+        });
+        const result = yield* Effect.result(
+          recoverSharedNativeRelease({
+            threadId,
+            projectId: created.payload.projectId,
+            projections,
+            sessions,
+            eventSink,
+            idAllocator,
+            runtimePolicy: { resolve: () => Effect.succeed(runtimePolicy) },
+          }),
+        );
+        const succeeds =
+          condition === "unknown" || condition === "pending" || condition === "imported";
+        assert.equal(result._tag, succeeds ? "Success" : "Failure");
+        const current = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+        assert.equal(current.providerThreads[0]?.nativeThreadRef?.nativeId, "native-thread");
+        assert.equal(
+          current.providerThreads[0]?.nativeMetadata?.codexSharedRelease?.state,
+          succeeds ? "ready" : "unknown",
+        );
+        const observed = yield* Ref.get(state);
+        assert.equal(
+          observed.openCount,
+          condition === "approval" || condition === "creation" ? 0 : 1,
+        );
+        assert.deepEqual(observed.unloadedNativeThreadIds, succeeds ? ["native-thread"] : []);
+        assert.equal(observed.closeCount, 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            instanceId: sharedSelection.instanceId,
+            idleTimeoutMs: 120_000,
+            hasPendingBackgroundWorkForThread: Effect.succeed(condition === "background"),
+            startTurn: Effect.die("Recovery must never start a turn"),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+);
+
+it.effect.each([
+  "initial",
+  "generated",
+  "external",
+  "unknown",
+  "reconciled",
+  "changed",
+  "late",
+  "terminated",
+  "unreadable",
+  "readback",
+  "before-release",
+  "no-process",
+  "saved-observation",
+  "saved-unknown",
+  "saved-unverified",
+  "saved-before-release",
+] as const)("prepares the current native title durably before release (%s)", (condition) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const name = yield* Ref.make<string | null>(
+      condition === "initial"
+        ? null
+        : condition === "external"
+          ? "External title"
+          : condition === "reconciled"
+            ? "Latest title"
+            : "Old title",
+    );
+    const writes = yield* Ref.make(0);
+    const reads = yield* Ref.make(0);
+    const beforeRelease = yield* Ref.make<Effect.Effect<void>>(Effect.void);
+    const writeStarted = yield* Deferred.make<void>();
+    let beforeWrite: (
+      thread: OrchestrationV2ProviderThread,
+      title: string,
+    ) => Effect.Effect<void> = () => Effect.die("Test title callback not initialized");
+    yield* Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("shared-title-release");
+      beforeWrite = (_thread, title) =>
+        Effect.gen(function* () {
+          const current = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+          assert.equal(current.providerThreads[0]?.nativeThreadRef?.nativeId, "native-thread");
+          assert.equal(
+            current.providerThreads[0]?.nativeMetadata?.codexNativeTitle?.status,
+            "pending",
+          );
+          yield* Ref.update(writes, (n) => n + 1);
+          if (condition === "late") {
+            yield* Deferred.succeed(writeStarted, undefined);
+            return yield* Effect.never;
+          }
+          yield* Ref.set(name, title);
+          if (condition === "changed" && (yield* Ref.get(writes)) === 1) {
+            yield* eventSink.write({
+              events: [
+                {
+                  id: yield* idAllocator.allocate.event({ threadId }),
+                  type: "thread.metadata-updated",
+                  threadId,
+                  occurredAt: yield* DateTime.now,
+                  payload: {
+                    ...current.thread,
+                    title: "Newer manual title",
+                    codexTitleSync: {
+                      status: "pending",
+                      version: 3,
+                      desiredTitle: "Newer manual title",
+                      ownerTitle: null,
+                      expectedOwnerTitle: null,
+                      source: "manual",
+                    },
+                  },
+                },
+              ],
+            });
+          }
+        }).pipe(Effect.orDie);
+      const providerSessionId = idAllocator.derive.providerSession({
+        providerInstanceId: sharedSelection.instanceId,
+      });
+      const created = yield* makeThreadCreatedEvent({ idAllocator, threadId, now });
+      const providerThread = {
+        ...makeProviderThread({ idAllocator, threadId, providerSessionId, now }),
+        providerInstanceId: sharedSelection.instanceId,
+        nativeMetadata: {
+          codexShared: true as const,
+          ...(condition === "initial"
+            ? {}
+            : {
+                codexNativeTitle: {
+                  status:
+                    condition === "unknown" ||
+                    condition === "saved-unknown" ||
+                    condition === "reconciled" ||
+                    condition === "terminated"
+                      ? ("unknown" as const)
+                      : condition === "saved-unverified"
+                        ? ("unverified" as const)
+                        : ("saved" as const),
+                  version: 1,
+                  desiredTitle:
+                    condition === "unknown" || condition === "reconciled"
+                      ? "Latest title"
+                      : "Old title",
+                  observedTitle: "Old title",
+                  process: { pid: 123, hostKey: "fixture", startedAt: "2026-01-01T00:00:00Z" },
+                },
+              }),
+        },
+      };
+      const observed = {
+        ...created.payload,
+        title: "Old title",
+        threadType: "codex-shared" as const,
+        codexTitleSync: {
+          status: "pending" as const,
+          version: 1,
+          desiredTitle: "Old title",
+          ownerTitle: null,
+          expectedOwnerTitle: null,
+          source: "generated" as const,
+        },
+      } as OrchestrationV2AppThread;
+      for (const [name, revision] of [
+        ["Old title", 1],
+        ["Latest title", 2],
+      ] as const)
+        Object.assign(
+          observed,
+          observeNativeTitle(
+            observed,
+            { sourceId: "source", nativeId: "native-thread", epoch: "metadata", name, revision },
+            true,
+            true,
+            true,
+          ),
+        );
+      yield* eventSink.write({
+        events: [
+          {
+            ...created,
+            payload: {
+              ...created.payload,
+              providerInstanceId: sharedSelection.instanceId,
+              modelSelection: sharedSelection,
+              threadType: "codex-shared",
+              codexSharedOwner: "native",
+              title: "Latest title",
+              codexTitleSync:
+                condition === "saved-observation"
+                  ? observed.codexTitleSync
+                  : {
+                      status: "pending",
+                      version: 2,
+                      desiredTitle: "Latest title",
+                      ownerTitle: null,
+                      expectedOwnerTitle: null,
+                      source: condition.startsWith("saved-") ? "saved" : "generated",
+                    },
+            },
+          },
+          {
+            id: yield* idAllocator.allocate.event({ threadId }),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: providerThread,
+          },
+        ],
+      });
+      const recover = recoverSharedNativeRelease({
+        threadId,
+        projectId: created.payload.projectId,
+        projections,
+        sessions,
+        eventSink,
+        idAllocator,
+        runtimePolicy: { resolve: () => Effect.succeed(runtimePolicy) },
+      });
+      if (condition === "before-release" || condition === "saved-before-release")
+        yield* Ref.set(
+          beforeRelease,
+          Effect.gen(function* () {
+            const latest = yield* projections.getThreadRecords(threadId, []);
+            yield* eventSink.write({
+              events: [
+                {
+                  id: yield* idAllocator.allocate.event({ threadId }),
+                  type: "thread.metadata-updated",
+                  threadId,
+                  occurredAt: yield* DateTime.now,
+                  payload: {
+                    ...latest.thread,
+                    title: "Newer manual title",
+                    codexTitleSync: {
+                      status: "pending",
+                      version: 3,
+                      desiredTitle: "Newer manual title",
+                      ownerTitle: null,
+                      expectedOwnerTitle: null,
+                      source: "manual",
+                    },
+                  },
+                },
+              ],
+            });
+          }).pipe(Effect.orDie),
+        );
+      const pending = yield* Effect.result(recover).pipe(Effect.forkChild);
+      if (condition === "late") {
+        yield* Deferred.await(writeStarted);
+        yield* TestClock.adjust("5 seconds");
+      }
+      const first = yield* Fiber.join(pending);
+      if (
+        condition === "changed" ||
+        condition === "before-release" ||
+        condition === "saved-before-release"
+      ) {
+        assert.equal(first._tag, "Failure");
+        yield* recover;
+      } else if (condition === "readback") {
+        assert.equal(first._tag, "Failure");
+        yield* recover;
+      } else if (
+        condition === "unknown" ||
+        condition === "late" ||
+        condition === "reconciled" ||
+        condition === "saved-unknown" ||
+        condition === "saved-unverified"
+      ) {
+        assert.equal(first._tag, "Failure");
+        assert.isEmpty((yield* Ref.get(state)).unloadedNativeThreadIds);
+        if (condition === "late") {
+          const blocked = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+          assert.equal(
+            blocked.providerThreads[0]?.nativeMetadata?.codexNativeTitle?.status,
+            "unknown",
+          );
+          yield* Ref.set(name, "Latest title");
+          assert.equal((yield* Effect.result(recover))._tag, "Failure");
+          assert.isEmpty((yield* Ref.get(state)).unloadedNativeThreadIds);
+        }
+      } else assert.equal(first._tag, "Success");
+      const current = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+      const saved = current.providerThreads[0]?.nativeMetadata?.codexNativeTitle;
+      assert.equal(
+        saved?.status,
+        condition === "saved-unverified"
+          ? "unverified"
+          : condition === "unreadable" || condition === "no-process"
+            ? "unavailable"
+            : condition === "external" || condition === "terminated"
+              ? "conflict"
+              : ["unknown", "reconciled", "late", "saved-unknown"].includes(condition)
+                ? "unknown"
+                : "saved",
+      );
+      assert.equal(
+        yield* Ref.get(writes),
+        [
+          "external",
+          "unknown",
+          "reconciled",
+          "terminated",
+          "unreadable",
+          "no-process",
+          "saved-observation",
+          "saved-unknown",
+          "saved-unverified",
+        ].includes(condition)
+          ? 0
+          : condition === "changed" || condition === "before-release"
+            ? 2
+            : 1,
+      );
+      assert.equal(current.thread.codexTitleSync?.status, "pending");
+      if (condition === "saved-observation") {
+        assert.equal(saved?.desiredTitle, "Old title");
+        assert.equal(
+          current.providerThreads[0]?.nativeMetadata?.codexSharedRelease?.state,
+          "ready",
+        );
+        yield* connectReleasedTitleFixture(current.thread).pipe(
+          Effect.scoped,
+          Effect.provide(
+            ServerConfig.layerTest("/workspace", { prefix: "t3-release-connect-" }).pipe(
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ),
+        );
+        const attached = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+        assert.equal(attached.thread.codexSharedOwner, "desktop");
+        assert.equal(attached.thread.title, "Latest title");
+        assert.equal(attached.thread.codexTitleSync?.source, "saved");
+        assert.equal(yield* Ref.get(writes), 0);
+      }
+      if (
+        condition === "changed" ||
+        condition === "before-release" ||
+        condition === "saved-before-release"
+      )
+        assert.equal(saved?.desiredTitle, "Newer manual title");
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          instanceId: sharedSelection.instanceId,
+          idleTimeoutMs: 120_000,
+          ...(condition === "before-release" || condition === "saved-before-release"
+            ? { beforeUnchangedWrite: beforeRelease, onlyBeforeSharedRelease: true }
+            : {}),
+          hasPendingBackgroundWorkForThread: Effect.succeed(false),
+          nativeTitle: {
+            process:
+              condition === "no-process"
+                ? Effect.undefined
+                : Effect.succeed({
+                    pid: 456,
+                    hostKey: "fixture",
+                    startedAt: "2026-02-01T00:00:00Z",
+                  }),
+            hasExited: () => Effect.succeed(condition === "terminated"),
+            read: () =>
+              Ref.updateAndGet(reads, (n) => n + 1).pipe(
+                Effect.flatMap((n) =>
+                  condition === "unreadable" || (condition === "readback" && n === 2)
+                    ? Effect.fail(
+                        new ProviderAdapter.ProviderAdapterProtocolError({
+                          driver: CODEX_DRIVER,
+                          detail: "Fixture read unavailable",
+                        }),
+                      )
+                    : Ref.get(name),
+                ),
+              ),
+            write: (thread, title) => beforeWrite(thread, title),
+          },
+        }),
+      ),
+      Effect.scoped,
+    );
+  }),
+);
+
 const modelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5.4",
 } satisfies ModelSelection;
+const sharedSelection = { ...modelSelection, instanceId: ProviderInstanceId.make("codex-desktop") };
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
+
+it.effect("keeps native and Desktop session caches isolated under one shared provider", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const selection = { ...modelSelection, instanceId: ProviderInstanceId.make("codex-desktop") };
+    yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const threadId = ThreadId.make("unified-owner");
+      const now = yield* DateTime.now;
+      const created = yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now });
+      const thread: OrchestrationV2AppThread = {
+        ...created.payload,
+        threadType: "codex-shared",
+        codexSharedOwner: "native",
+        providerInstanceId: selection.instanceId,
+        modelSelection: selection,
+      };
+      yield* sink.write({ events: [{ ...created, payload: thread }] });
+      const nativeSessionId = yield* ids.allocate.providerSession({
+        providerInstanceId: selection.instanceId,
+        threadId,
+      });
+      const input = {
+        threadId,
+        providerSessionId: nativeSessionId,
+        modelSelection: selection,
+        runtimePolicy,
+      };
+      const nativeRuntime = yield* manager.open(input);
+      assert.strictEqual(yield* manager.open(input), nativeRuntime);
+      yield* sink.write({
+        events: [
+          {
+            ...created,
+            id: yield* ids.allocate.event({ threadId }),
+            type: "thread.metadata-updated",
+            payload: { ...thread, codexSharedOwner: "desktop" },
+          },
+        ],
+      });
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(manager.open(input))));
+      assert.equal((yield* Ref.get(state)).openCount, 1);
+      assert.equal((yield* Ref.get(state)).closeCount, 0);
+      const followerSessionId = yield* ids.allocate.providerSession({
+        providerInstanceId: selection.instanceId,
+        threadId,
+      });
+      assert.notStrictEqual(
+        yield* manager.open({ ...input, providerSessionId: followerSessionId }),
+        nativeRuntime,
+      );
+      assert.equal((yield* Ref.get(state)).openCount, 2);
+    }).pipe(
+      Effect.provide(layerTest({ state, instanceId: selection.instanceId, idleTimeoutMs: 60_000 })),
+    );
+  }),
+);
 
 const runtimePolicy = {
   runtimeMode: "full-access",
@@ -422,6 +1051,7 @@ function unimplemented(detail: string) {
 const makeProviderAdapter = Effect.fnUntraced(function* (
   state: Ref.Ref<TestProviderRuntimeState>,
   options: {
+    readonly instanceId?: ProviderInstanceId;
     readonly failEventStream?: boolean;
     readonly capabilities?: OrchestrationV2ProviderCapabilities;
     readonly extensionStatuses?: OrchestrationV2ProviderSession["extensionStatuses"];
@@ -439,6 +1069,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly startTurn?: Effect.Effect<void>;
     readonly interruptTurn?: Effect.Effect<void>;
     readonly beforeUnload?: Effect.Effect<void>;
+    readonly nativeTitle?: ProviderAdapter.ProviderAdapterV2SessionRuntime["nativeTitle"];
     readonly spawnBeforeOpen?: boolean;
     readonly scopeCloseReached?: Deferred.Deferred<void>;
   } = {},
@@ -458,7 +1089,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     ).pipe(Effect.andThen(Effect.never)),
   );
   return ProviderAdapter.ProviderAdapterV2.of({
-    instanceId: ProviderInstanceId.make("codex"),
+    instanceId: options.instanceId ?? modelSelection.instanceId,
     driver: CODEX_DRIVER,
     getCapabilities: () => Effect.succeed(options.capabilities ?? CodexCapabilities),
     planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
@@ -487,6 +1118,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
             now,
             ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
           }),
+          providerInstanceId: options.instanceId ?? modelSelection.instanceId,
           ...(options.extensionStatuses === undefined
             ? {}
             : { extensionStatuses: options.extensionStatuses }),
@@ -506,7 +1138,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
         }
 
         return {
-          instanceId: ProviderInstanceId.make("codex"),
+          instanceId: options.instanceId ?? modelSelection.instanceId,
           driver: CODEX_DRIVER,
           providerSessionId: input.providerSessionId,
           get providerSession() {
@@ -539,6 +1171,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
                 hasPendingBackgroundWorkForThread: () => options.hasPendingBackgroundWorkForThread!,
               }),
           ensureThread: () => unimplemented("ensureThread unused in test"),
+          ...(options.nativeTitle ? { nativeTitle: options.nativeTitle } : {}),
           resumeThread: (threadInput) =>
             Ref.update(state, (current) => ({
               ...current,
@@ -573,6 +1206,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
 });
 
 function layerTest(input: {
+  readonly instanceId?: ProviderInstanceId;
   readonly state: Ref.Ref<TestProviderRuntimeState>;
   readonly idleTimeoutMs: number;
   readonly maxIdlePinMs?: number;
@@ -590,6 +1224,7 @@ function layerTest(input: {
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
   readonly beforeUnchangedWrite?: Ref.Ref<Effect.Effect<void>>;
+  readonly onlyBeforeSharedRelease?: boolean;
   readonly pauseResolve?: {
     readonly armed: Ref.Ref<boolean>;
     readonly paused: Deferred.Deferred<void>;
@@ -601,6 +1236,7 @@ function layerTest(input: {
   readonly startTurn?: Effect.Effect<void>;
   readonly interruptTurn?: Effect.Effect<void>;
   readonly beforeUnload?: Effect.Effect<void>;
+  readonly nativeTitle?: ProviderAdapter.ProviderAdapterV2SessionRuntime["nativeTitle"];
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
@@ -612,12 +1248,16 @@ function layerTest(input: {
       : input.pauseAttachWrite !== undefined
         ? layerPausingAttachEventSink(input.pauseAttachWrite)
         : input.beforeUnchangedWrite !== undefined
-          ? layerBeforeUnchangedWriteEventSink(input.beforeUnchangedWrite)
+          ? layerBeforeUnchangedWriteEventSink(
+              input.beforeUnchangedWrite,
+              input.onlyBeforeSharedRelease,
+            )
           : input.failReleaseEventWrites
             ? layerFailingReleaseEventSink
             : layerTestEventSink;
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
+      ...(input.instanceId === undefined ? {} : { instanceId: input.instanceId }),
       failEventStream: input.failEventStream ?? false,
       ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
       ...(input.extensionStatuses === undefined
@@ -640,6 +1280,7 @@ function layerTest(input: {
       ...(input.startTurn === undefined ? {} : { startTurn: input.startTurn }),
       ...(input.interruptTurn === undefined ? {} : { interruptTurn: input.interruptTurn }),
       ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
+      ...(input.nativeTitle ? { nativeTitle: input.nativeTitle } : {}),
       ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
       ...(input.scopeCloseReached === undefined
         ? {}
@@ -4341,6 +4982,220 @@ it.effect(
 
         assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-child-thread"]);
       }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })), Effect.scoped);
+    }),
+);
+
+it.effect.each(["thread", "runtime", "thread after pin expiry"] as const)(
+  "ProviderSessionManagerV2 retains an idle %s when its background-work probe fails, then releases after recovery",
+  (probe) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const unavailable = yield* Ref.make(true);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("idle-unload-unknown-background-work");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* runtime.resumeThread({ providerThread, threadId, modelSelection, runtimePolicy });
+
+        const subscription = yield* runtime.subscribeEvents!;
+        const queue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(queue);
+        const terminal: ProviderAdapter.ProviderAdapterV2Event = {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: providerThread.id,
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: CODEX_DRIVER,
+            nativeTurnId: "idle-unload-terminal",
+          }),
+          runOrdinal: 1,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        };
+        yield* Queue.offer(queue!, terminal);
+        assert.deepEqual(yield* subscription.events.pipe(Stream.runHead), Option.some(terminal));
+
+        yield* TestClock.adjust("2 seconds");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+
+        yield* Ref.set(unavailable, false);
+        yield* TestClock.adjust("1 second");
+        if (probe === "thread") {
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread"]);
+        } else {
+          assert.equal((yield* Ref.get(state)).closeCount, 1);
+        }
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            maxIdlePinMs: probe === "thread" ? 60_000 : 1000,
+            hasPendingBackgroundWork:
+              probe !== "runtime"
+                ? Effect.succeed(true)
+                : Effect.gen(function* () {
+                    if (yield* Ref.get(unavailable))
+                      return yield* Effect.die("Background state unavailable");
+                    return false;
+                  }),
+            hasPendingBackgroundWorkForThread: Effect.gen(function* () {
+              if (probe === "runtime") return true;
+              if (yield* Ref.get(unavailable))
+                return yield* Effect.die("Background state unavailable");
+              return false;
+            }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+);
+
+it.effect.each(["idle", "approval", "unknown", "deferred", "unconfirmed"] as const)(
+  "releases only a known idle shared native writer and resumes its original ID (%s)",
+  (condition) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const backgroundPending = yield* Ref.make(condition === "deferred");
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("shared-idle-release");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: sharedSelection.instanceId,
+        });
+        const created = yield* makeThreadCreatedEvent({ idAllocator, threadId, now });
+        const providerThread = {
+          ...makeProviderThread({
+            idAllocator,
+            threadId,
+            providerSessionId,
+            now,
+          }),
+          providerInstanceId: sharedSelection.instanceId,
+        };
+        const pending = yield* makePendingRuntimeRequestEvents({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          providerThread,
+          now,
+        });
+        yield* eventSink.write({
+          events: [
+            {
+              ...created,
+              payload: {
+                ...created.payload,
+                threadType: "codex-shared",
+                codexSharedOwner: "native",
+                providerInstanceId: sharedSelection.instanceId,
+                modelSelection: sharedSelection,
+              },
+            },
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: providerThread,
+            },
+            ...(condition === "approval" ? pending.events : []),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection: sharedSelection,
+          runtimePolicy,
+        });
+        const resume = runtime.resumeThread({
+          providerThread,
+          threadId,
+          modelSelection: sharedSelection,
+          runtimePolicy,
+        });
+        yield* resume;
+        const subscription = yield* runtime.subscribeEvents!;
+        const queue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId))!;
+        const terminal: ProviderAdapter.ProviderAdapterV2Event = {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: providerThread.id,
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: CODEX_DRIVER,
+            nativeTurnId: "shared-terminal",
+          }),
+          runOrdinal: 1,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        };
+        yield* Queue.offer(queue, terminal);
+        assert.deepEqual(yield* subscription.events.pipe(Stream.runHead), Option.some(terminal));
+        yield* TestClock.adjust("2 seconds");
+        if (condition === "deferred") {
+          assert.isEmpty((yield* Ref.get(state)).unloadedNativeThreadIds);
+          yield* Ref.set(backgroundPending, false);
+          yield* TestClock.adjust("2 seconds");
+        }
+        if (condition === "unconfirmed") yield* TestClock.adjust("96 seconds");
+        const released = condition === "idle" || condition === "deferred";
+        assert.deepEqual(
+          (yield* Ref.get(state)).unloadedNativeThreadIds,
+          released ? ["native-thread"] : [],
+        );
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const current = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+        assert.equal(
+          current.providerThreads[0]?.nativeMetadata?.codexSharedRelease?.state,
+          released ? "ready" : condition === "unconfirmed" ? "unknown" : undefined,
+        );
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+        if (condition !== "unconfirmed") {
+          yield* resume;
+          assert.equal((yield* Ref.get(state)).resumeCount, released ? 2 : 1);
+        }
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            instanceId: sharedSelection.instanceId,
+            idleTimeoutMs: condition === "unconfirmed" ? 120_000 : 60_000,
+            hasPendingBackgroundWorkForThread:
+              condition === "unknown"
+                ? Effect.die("Probe unavailable")
+                : Ref.get(backgroundPending),
+            ...(condition === "unconfirmed" ? { beforeUnload: Effect.never } : {}),
+          }),
+        ),
+        Effect.scoped,
+      );
     }),
 );
 

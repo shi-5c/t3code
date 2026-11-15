@@ -450,6 +450,7 @@ export function buildLocalDraftThread(
     title: "New thread",
     providerInstanceId: fallbackModelSelection.instanceId,
     modelSelection: fallbackModelSelection,
+    threadType: draftThread.threadType ?? "t3",
     runtimeMode: draftThread.runtimeMode,
     interactionMode: draftThread.interactionMode,
     branch: draftThread.branch,

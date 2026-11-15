@@ -15,6 +15,8 @@ import {
   ComposerContextId,
   type ChatAttachment,
   CommandId,
+  CheckpointId,
+  CheckpointScopeId,
   DEFAULT_SERVER_SETTINGS,
   GitCommandError,
   MessageId,
@@ -118,6 +120,7 @@ const claudeAdapter = {
 } as ProviderAdapter.ProviderAdapterV2["Service"];
 
 interface HarnessOptions {
+  readonly defaultThreadType?: "t3" | "codex-shared";
   readonly closeTerminal?: TerminalManager.TerminalManager["Service"]["close"];
   readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
@@ -191,7 +194,7 @@ function makeHarness(options: HarnessOptions = {}) {
       getById: (id) =>
         Effect.succeed(
           id === projectId
-            ? Option.some(project)
+            ? Option.some({ ...project, defaultThreadType: options.defaultThreadType ?? "t3" })
             : id === otherProjectId
               ? Option.some(otherProject)
               : Option.none(),
@@ -236,6 +239,7 @@ function makeHarness(options: HarnessOptions = {}) {
     Layer.provide(
       Layer.mergeAll(
         layerExternalServices,
+        layerRegistry,
         layerThreadManagement,
         layerReceipts,
         IdAllocator.layer,
@@ -252,6 +256,7 @@ function makeHarness(options: HarnessOptions = {}) {
               workspaceRoot: project.workspaceRoot,
               defaultModelSelection: project.defaultModelSelection,
               defaultThreadEnvMode: null,
+              defaultThreadType: options.defaultThreadType ?? "t3",
               autoPull: false,
               faviconPath: null,
               projectIcon: null,
@@ -324,6 +329,77 @@ function launchInput(input: {
     creationSource: "web" as const,
   };
 }
+
+it.effect.each([undefined, "t3", "codex-shared"] as const)(
+  "creates the selected thread type %s with the native Codex provider",
+  (threadType) => {
+    const instanceId = ProviderInstanceId.make(threadType === "t3" ? "codex" : "codex-desktop");
+    const harness = makeHarness({
+      defaultThreadType: "codex-shared",
+      adapters: [{ ...adapter, instanceId }],
+      serverSettings: {
+        projectSettingsOverrides: {
+          [projectId]: { providerInstances: { [instanceId]: { enabled: true } } },
+        },
+      },
+    });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const input = {
+        ...launchInput({ command: "type-choice", thread: "type-choice" }),
+        modelSelection: { ...modelSelection, instanceId },
+      };
+      const result = yield* launches
+        .launch({ ...input, ...(threadType ? { threadType } : {}) })
+        .pipe(Effect.exit);
+      assert.isTrue(
+        Exit.isSuccess(result),
+        Exit.isFailure(result) ? Cause.pretty(result.cause) : undefined,
+      );
+      const projection = yield* threads.getThreadProjection(input.threadId);
+      assert.strictEqual(projection.thread.threadType, threadType ?? "codex-shared");
+      assert.strictEqual(
+        projection.thread.codexSharedOwner,
+        threadType === "t3" ? undefined : "native",
+      );
+      assert.strictEqual(projection.thread.providerInstanceId, instanceId);
+      const replay = yield* launches.launch({ ...input, ...(threadType ? { threadType } : {}) });
+      assert.strictEqual(replay.threadId, input.threadId);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect.each(["claudeAgent", "codex"])(
+  "rejects shared creation through a non-reserved %s provider before allocating a managed folder",
+  (driver) => {
+    const allocated: ThreadId[] = [];
+    const harness = makeHarness({
+      adapters: [{ ...adapter, driver: ProviderDriverKind.make(driver) }],
+      managedFolders: Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+        namedProjectsRoot: "/projects",
+        isScratchProject: () => Effect.succeed(false),
+        folderForThread: ({ threadId }) =>
+          Effect.sync(() => {
+            allocated.push(threadId);
+            return Option.some("/scratch/should-not-exist");
+          }),
+      }),
+    });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const result = yield* launches
+        .launch({
+          ...launchInput({ command: "invalid-shared", thread: "invalid-shared", message: "first" }),
+          threadType: "codex-shared",
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(result));
+      assert.isEmpty(allocated);
+      assert.equal(harness.runSetup.mock.calls.length, 0);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
 
 it.effect.each(
   (["new", "existing"] as const).flatMap((target) =>
@@ -837,6 +913,93 @@ it.effect("arms durable title generation after accepting the first message", () 
   }),
 );
 
+it.effect.each(["explicit", "legacy"] as const)(
+  "rejects fork, side chat, merge and rewind of a %s shared conversation before producing effects",
+  (identity) =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const sql = yield* SqlClient.SqlClient;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const created = yield* launches.launch(
+          launchInput({ command: "shared-operations:create", thread: "shared-operations" }),
+        );
+        const thread = created.projection.thread;
+        if (identity === "explicit") {
+          yield* sql`UPDATE orchestration_v2_projection_threads
+          SET payload_json = json_set(payload_json, '$.threadType', 'codex-shared')
+          WHERE thread_id = ${thread.id}`;
+        } else {
+          yield* sql`UPDATE orchestration_v2_projection_threads
+          SET payload_json = json_set(json_remove(payload_json, '$.threadType'), '$.providerInstanceId', 'codex-desktop')
+          WHERE thread_id = ${thread.id}`;
+        }
+        const ordinary = yield* launches.launch(
+          launchInput({ command: "ordinary:create", thread: "ordinary" }),
+        );
+        const targetThreadId = ThreadId.make("shared-operations:target");
+        for (const command of [
+          {
+            type: "thread.fork",
+            commandId: CommandId.make("shared-operations:fork"),
+            sourceThreadId: thread.id,
+            targetThreadId,
+            sourcePoint: { type: "latest_stable" },
+            createdBy: "user",
+            creationSource: "web",
+          },
+          {
+            type: "thread.fork",
+            commandId: CommandId.make("shared-operations:side"),
+            sourceThreadId: thread.id,
+            targetThreadId,
+            sourcePoint: { type: "latest_stable" },
+            sideChat: true,
+            createdBy: "user",
+            creationSource: "web",
+          },
+          {
+            type: "checkpoint.rollback",
+            commandId: CommandId.make("shared-operations:rewind"),
+            threadId: thread.id,
+            scopeId: CheckpointScopeId.make("unused"),
+            checkpointId: CheckpointId.make("unused"),
+          },
+          {
+            type: "thread.merge_back",
+            commandId: CommandId.make("shared-operations:merge-source"),
+            sourceThreadId: thread.id,
+            targetThreadId: ordinary.threadId,
+            sourcePoint: { type: "latest_stable" },
+            createdBy: "user",
+            creationSource: "web",
+          },
+          {
+            type: "thread.merge_back",
+            commandId: CommandId.make("shared-operations:merge-target"),
+            sourceThreadId: ordinary.threadId,
+            targetThreadId: thread.id,
+            sourcePoint: { type: "latest_stable" },
+            createdBy: "user",
+            creationSource: "web",
+          },
+        ] as const) {
+          const rejected = yield* threads.dispatch(command).pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(rejected));
+          if (Exit.isFailure(rejected))
+            assert.include(
+              Cause.pretty(rejected.cause),
+              "Fork and rewind shared conversations in Codex Desktop",
+            );
+          assert.isNull(yield* threads.getThreadShell(targetThreadId));
+          assert.isEmpty(yield* outbox.listByCommandId(command.commandId));
+        }
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
 it.effect("does not update a reused thread title when the initial message is rejected", () =>
   Effect.gen(function* () {
     const harness = makeHarness();
@@ -861,6 +1024,15 @@ it.effect("does not update a reused thread title when the initial message is rej
       });
 
       const commandId = CommandId.make("command:launch:reused-title-failure");
+      const wrongType = yield* launches
+        .launch({
+          ...launchInput({ command: "command:launch:reused-type-failure", thread: threadId }),
+          reuseExistingThread: true,
+          threadType: "codex-shared",
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(wrongType));
+      assert.equal((yield* threads.getThreadProjection(threadId)).thread.threadType, "t3");
       const failed = yield* launches
         .launch({
           ...launchInput({

@@ -477,7 +477,7 @@ describe("V2 client presentation", () => {
           status: "pending" as const,
           responseCapability: {
             type: "not_resumable" as const,
-            reason: "provider disconnected",
+            reason: "Answer this request in Codex Desktop.",
           },
           createdAt: now,
           resolvedAt: null,
@@ -494,6 +494,7 @@ describe("V2 client presentation", () => {
         createdAt: "2026-06-20T01:00:00.000Z",
         detail: "Allow command?",
         responseCapability: "not_resumable",
+        responseUnavailableReason: "Answer this request in Codex Desktop.",
       },
     ]);
     expect(derivePendingThreadRequests(projection).userInputs).toEqual([]);

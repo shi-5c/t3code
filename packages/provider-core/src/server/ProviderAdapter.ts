@@ -486,6 +486,8 @@ export interface ProviderAdapterV2OpenSessionInput {
   readonly resumeFromSession?: OrchestrationV2ProviderSession;
   readonly initialNativeThreadId?: string;
   readonly initialProviderItemIdentityVersion?: 2;
+  /** Internal routing decision read from the durable shared-thread state. */
+  readonly codexSharedOwner?: "native" | "desktop";
 }
 
 export interface ProviderAdapterV2EnsureThreadInput {
@@ -653,6 +655,23 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly ensureThread: (
     input: ProviderAdapterV2EnsureThreadInput,
   ) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
+  /** Metadata only; callers persist an intent before writing and reconcile unknown outcomes. */
+  readonly nativeTitle?: {
+    readonly process?: Effect.Effect<
+      { readonly pid: number; readonly hostKey: string; readonly startedAt: string } | undefined
+    >;
+    readonly hasExited?: (process: {
+      readonly pid: number;
+      readonly hostKey: string;
+    }) => Effect.Effect<boolean>;
+    readonly read: (
+      thread: OrchestrationV2ProviderThread,
+    ) => Effect.Effect<string | null, ProviderAdapterV2Error>;
+    readonly write: (
+      thread: OrchestrationV2ProviderThread,
+      title: string,
+    ) => Effect.Effect<void, ProviderAdapterV2Error>;
+  };
   readonly resumeThread: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly threadId?: ThreadId;
@@ -698,6 +717,8 @@ export interface ProviderAdapterV2SessionRuntime {
   }) => Effect.Effect<void | ProviderAdapterV2SubagentOutcome, ProviderAdapterV2Error>;
   readonly unloadThread?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
+    /** Shared writers need positive native closure, not just an unsubscribe ACK. */
+    readonly confirmRelease?: boolean;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly respondToRuntimeRequest: (
     input: ProviderAdapterV2RuntimeRequestResponseInput,

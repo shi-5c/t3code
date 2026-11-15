@@ -1,5 +1,9 @@
 import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwareness";
-import { pendingGuestMessageCount } from "@t3tools/contracts";
+import {
+  CODEX_SHARED_INSTANCE_ID,
+  pendingGuestMessageCount,
+  threadTypeOf,
+} from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
 import { projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
@@ -520,6 +524,10 @@ export interface ProjectionStoreV2Shape {
   >;
   /** Threads that are not deleted, archived ones included. */
   readonly countThreads: () => Effect.Effect<number, ProjectionStoreV2Error>;
+  readonly listSharedNativeThreads: () => Effect.Effect<
+    ReadonlyArray<{ threadId: ThreadId; projectId: ProjectId }>,
+    ProjectionStoreV2Error
+  >;
   /** Every active thread, in shell order. */
   readonly listActiveShellIndex: () => Effect.Effect<
     ReadonlyArray<ActiveShellIndexEntry>,
@@ -546,6 +554,13 @@ export interface ProjectionStoreV2Shape {
   /** The thread whose current guest share has this id. Scans thread rows; only redeem uses it. */
   readonly findGuestShareThreadId: (
     shareId: GuestShareId,
+  ) => Effect.Effect<ThreadId | null, ProjectionStoreV2Error>;
+  readonly findNativeThreadOwner: (
+    input: Pick<OrchestrationV2ProviderThread, "driver" | "providerInstanceId"> & {
+      readonly nativeThreadId: string;
+      readonly scope?: "instance" | "all" | "shared";
+      readonly excludeThreadId?: ThreadId;
+    },
   ) => Effect.Effect<ThreadId | null, ProjectionStoreV2Error>;
   readonly getThread: (
     threadId: ThreadId,
@@ -1187,9 +1202,13 @@ const decodePullRequestThread = Schema.decodeUnknownEffect(
   Schema.fromJsonString(PullRequestThread),
 );
 
-const decodeThreadPayload = Schema.decodeUnknownEffect(
+const decodeThreadJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJsonSchema),
 );
+const decodeThreadPayload = (payload: string) =>
+  decodeThreadJson(payload).pipe(
+    Effect.map((thread) => ({ ...thread, threadType: threadTypeOf(thread) })),
+  );
 const decodeRunPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2RunJsonSchema),
 );
@@ -1630,6 +1649,16 @@ export function threadShellFromProjection(
     title: projection.thread.title,
     providerInstanceId: projection.thread.providerInstanceId,
     modelSelection: projection.thread.modelSelection,
+    threadType: threadTypeOf(projection.thread),
+    ...(projection.thread.codexSharedOwner === undefined
+      ? {}
+      : { codexSharedOwner: projection.thread.codexSharedOwner }),
+    ...(projection.thread.codexTitleSync === undefined
+      ? {}
+      : { codexTitleSync: projection.thread.codexTitleSync }),
+    ...(projection.thread.codexDesktopHistory === undefined
+      ? {}
+      : { codexDesktopHistory: projection.thread.codexDesktopHistory }),
     runtimeMode: projection.thread.runtimeMode,
     interactionMode: projection.thread.interactionMode,
     branch: projection.thread.branch,
@@ -1933,6 +1962,16 @@ function shellFromState(input: {
     title: input.state.thread.title,
     providerInstanceId: input.state.thread.providerInstanceId,
     modelSelection: input.state.thread.modelSelection,
+    threadType: threadTypeOf(input.state.thread),
+    ...(input.state.thread.codexSharedOwner === undefined
+      ? {}
+      : { codexSharedOwner: input.state.thread.codexSharedOwner }),
+    ...(input.state.thread.codexTitleSync === undefined
+      ? {}
+      : { codexTitleSync: input.state.thread.codexTitleSync }),
+    ...(input.state.thread.codexDesktopHistory === undefined
+      ? {}
+      : { codexDesktopHistory: input.state.thread.codexDesktopHistory }),
     runtimeMode: input.state.thread.runtimeMode,
     interactionMode: input.state.thread.interactionMode,
     branch: input.state.thread.branch,
@@ -7451,6 +7490,25 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       }));
     }, Effect.mapError(shellSnapshotReadError));
 
+    const listSharedNativeThreads = Effect.fn("ProjectionStore.listSharedNativeThreads")(
+      function* () {
+        const rows = yield* sql<{ readonly thread_id: string; readonly project_id: string }>`
+        SELECT thread_id, project_id FROM orchestration_v2_projection_threads
+        WHERE deleted_at IS NULL AND archived_at IS NULL
+          AND json_extract(payload_json, '$.threadType') = 'codex-shared'
+          AND COALESCE(json_extract(payload_json, '$.codexSharedOwner'),
+            CASE WHEN json_extract(payload_json, '$.providerInstanceId') = 'codex-desktop'
+              THEN 'desktop' ELSE 'native' END) = 'native'
+        ORDER BY thread_id
+      `;
+        return rows.map((row) => ({
+          threadId: ThreadId.make(row.thread_id),
+          projectId: ProjectId.make(row.project_id),
+        }));
+      },
+      Effect.mapError(shellSnapshotReadError),
+    );
+
     const getThreadLinkMetadata = Effect.fn("ProjectionStore.getThreadLinkMetadata")(function* (
       threadIds: ReadonlyArray<ThreadId>,
     ) {
@@ -7479,6 +7537,32 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         WHERE deleted_at IS NULL AND thread_id IN ${sql.in(threadIds)}
       `;
       return Object.fromEntries(rows.map((row) => [row.thread_id, row.title]));
+    }, Effect.mapError(shellSnapshotReadError));
+
+    const findNativeThreadOwner = Effect.fn("ProjectionStore.findNativeThreadOwner")(function* (
+      input: Parameters<ProjectionStoreV2Shape["findNativeThreadOwner"]>[0],
+    ) {
+      const rows = yield* sql<{ readonly thread_id: string }>`
+        SELECT p.thread_id FROM orchestration_v2_projection_provider_threads p
+        WHERE p.driver = ${input.driver}
+          ${input.scope === "all" || input.scope === "shared" ? sql`` : sql`AND p.provider_instance_id = ${input.providerInstanceId}`}
+          AND json_extract(p.payload_json, '$.nativeThreadRef.nativeId') = ${input.nativeThreadId}
+          ${input.excludeThreadId === undefined ? sql`` : sql`AND p.thread_id <> ${input.excludeThreadId}`}
+          ${
+            input.scope !== "shared"
+              ? sql``
+              : sql`AND EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_threads t
+            WHERE t.thread_id = p.thread_id
+              AND COALESCE(json_extract(t.payload_json, '$.threadType'),
+                CASE WHEN t.provider_instance_id = ${CODEX_SHARED_INSTANCE_ID}
+                  THEN 'codex-shared' ELSE 't3' END) = 'codex-shared'
+          )`
+          }
+        ORDER BY (p.provider_instance_id = ${input.providerInstanceId}) DESC
+        LIMIT 1
+      `;
+      return rows[0] === undefined ? null : ThreadId.make(rows[0].thread_id);
     }, Effect.mapError(shellSnapshotReadError));
 
     const findGuestShareThreadId = Effect.fn("ProjectionStore.findGuestShareThreadId")(function* (
@@ -7640,10 +7724,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       listActiveSubagentThreadIds: readOnReader(listActiveSubagentThreadIds),
       countThreads: readOnReader(countThreads),
       listActiveShellIndex: readOnReader(listActiveShellIndex),
+      listSharedNativeThreads: readOnReader(listSharedNativeThreads),
       readShellSnapshot: readOnReader(readShellSnapshot),
       listOlderSettledThreads: readOnReader(listOlderSettledThreads),
       getThreadShell: readOnReader(getThreadShell),
       findGuestShareThreadId: readOnReader(findGuestShareThreadId),
+      findNativeThreadOwner: readOnReader(findNativeThreadOwner),
       getThread: readOnReader(getThread),
       getSettlementCandidates: readOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),

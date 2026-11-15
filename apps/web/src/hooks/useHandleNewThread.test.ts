@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import type { EnvironmentId, ProjectId, RuntimeMode } from "@t3tools/contracts";
+import type { EnvironmentId, ProjectId, RuntimeMode, ThreadType } from "@t3tools/contracts";
 
 const testState = vi.hoisted(() => {
   let completeProjectFileRead: (value: null) => void = () => undefined;
   let projectFileRead = Promise.resolve<null>(null);
   let projectRemoved = false;
+  let projectLoading = false;
+  let projectArrival = Promise.resolve();
+  let arriveProject = () => undefined as void;
+  let failProject = (_error: Error) => undefined as void;
+  let openDraftType: ThreadType = "t3";
   let connectedEnvironmentIds = ["environment-primary", "environment-ssh"];
   let targetSettings = {
     defaultThreadEnvMode: "local" as "local" | "worktree" | null,
@@ -30,6 +35,7 @@ const testState = vi.hoisted(() => {
     }),
   };
   const draftStore = {
+    stickyActiveProvider: null as string | null,
     getComposerDraft: vi.fn((draftId: string) => ({ draftId })),
     getDraftSessionByLogicalProjectKey: vi.fn(() => storedDraft),
     getDraftSession: vi.fn(() =>
@@ -42,6 +48,7 @@ const testState = vi.hoisted(() => {
             createdAt: "2026-01-01T00:00:00.000Z",
             runtimeMode: "full-access",
             interactionMode: "default",
+            threadType: openDraftType,
           },
     ),
     getDraftThread: vi.fn(() => null),
@@ -53,6 +60,7 @@ const testState = vi.hoisted(() => {
   };
 
   return {
+    selectionOverrides: vi.fn(() => null),
     completeProjectFileRead: (value: null) => completeProjectFileRead(value),
     draftStore,
     get projectFileRead() {
@@ -60,6 +68,27 @@ const testState = vi.hoisted(() => {
     },
     get projectRemoved() {
       return projectRemoved;
+    },
+    get projectLoading() {
+      return projectLoading;
+    },
+    get projectArrival() {
+      return projectArrival;
+    },
+    delayProject() {
+      projectLoading = true;
+      projectArrival = new Promise<void>((resolve, reject) => {
+        arriveProject = () => {
+          projectLoading = false;
+          resolve();
+        };
+        failProject = reject;
+      });
+    },
+    arriveProject: () => arriveProject(),
+    failProject: (error: Error) => failProject(error),
+    changeOpenDraftType(type: ThreadType) {
+      openDraftType = type;
     },
     get connectedEnvironmentIds() {
       return connectedEnvironmentIds;
@@ -95,6 +124,9 @@ const testState = vi.hoisted(() => {
       openDraftRoute = null;
       draftsWithUserText = new Set();
       projectRemoved = false;
+      projectLoading = false;
+      projectArrival = Promise.resolve();
+      openDraftType = "t3";
       connectedEnvironmentIds = ["environment-primary", "environment-ssh"];
       targetSettings = {
         defaultThreadEnvMode: workspaceDefaults.envMode,
@@ -107,6 +139,7 @@ const testState = vi.hoisted(() => {
       draftStore.setDraftThreadContext.mockClear();
       draftStore.setLogicalProjectDraftThreadId.mockClear();
       draftStore.setPrompt.mockClear();
+      draftStore.stickyActiveProvider = null;
       projectFileRead = new Promise<null>((resolve) => {
         completeProjectFileRead = resolve;
       });
@@ -151,6 +184,7 @@ vi.mock("@t3tools/client-runtime/environment", () => ({
   scopeThreadRef: (environmentId: string, threadId: string) => ({ environmentId, threadId }),
 }));
 vi.mock("@t3tools/contracts", () => ({
+  CODEX_SHARED_INSTANCE_ID: "codex-desktop",
   DEFAULT_RUNTIME_MODE: "default",
   DEFAULT_SERVER_SETTINGS: {},
 }));
@@ -201,9 +235,15 @@ vi.mock("../composerDraftStore", () => {
 vi.mock("../lib/chatThreadActions", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/chatThreadActions")>()),
   hasExplicitComposerModelSelection: () => false,
-  resolveNewThreadModelSelectionOverride: () => null,
+  resolveNewThreadModelSelectionOverride: testState.selectionOverrides,
 }));
-vi.mock("../providerInstances", () => ({ resolveDefaultProviderModelSelection: () => null }));
+vi.mock("../providerInstances", () => ({
+  resolveDefaultProviderModelSelection: () => null,
+  resolveProjectDefaultProviderModelSelection: () => ({
+    instanceId: "codex-default",
+    model: "fallback",
+  }),
+}));
 vi.mock("../lib/t3ProjectFileDefaults", () => ({
   readT3ProjectFile: () => testState.projectFileRead,
 }));
@@ -224,9 +264,17 @@ vi.mock("../state/entities", () => {
     defaultThreadEnvMode: null,
     defaultModelSelection: null,
   };
+  const sharedProject = { ...project, id: "project-shared", defaultThreadType: "codex-shared" };
   return {
-    readProject: () => (testState.projectRemoved ? null : project),
-    readProjects: () => (testState.projectRemoved ? [] : [project]),
+    readProject: (ref: { projectId: string }) =>
+      testState.projectRemoved || testState.projectLoading
+        ? null
+        : ref.projectId === "project-shared"
+          ? sharedProject
+          : project,
+    readProjects: () =>
+      testState.projectRemoved || testState.projectLoading ? [] : [project, sharedProject],
+    waitForProject: () => testState.projectArrival,
     readThreadShell: () => null,
     readThreadShells: () => [],
     useProjects: () => [],
@@ -252,6 +300,36 @@ vi.mock("../uiStateStore", () => ({
 vi.mock("./useSettings", () => ({ getClientSettings: () => ({}) }));
 
 import { resolveDefaultProjectRef, useNewThreadHandler } from "./useHandleNewThread";
+
+it("keeps an explicit project model when leaving a shared provider", async () => {
+  testState.reset(null);
+  testState.draftStore.stickyActiveProvider = "codex-desktop";
+  const configured = { instanceId: "codex-configured", model: "project-model" };
+  testState.targetSettings.defaultModelSelection = configured as never;
+  await useNewThreadHandler()({
+    environmentId: "environment-ssh",
+    projectId: "project-remote",
+  } as never);
+  expect(testState.selectionOverrides).toHaveBeenLastCalledWith(
+    expect.objectContaining({ projectDefaultSelection: configured }),
+  );
+});
+
+it.each(["codex-desktop"])(
+  "keeps the configured shared provider %s for new shared drafts",
+  async (instanceId) => {
+    testState.reset(null);
+    const configured = { instanceId, model: "project-model" };
+    testState.targetSettings.defaultModelSelection = configured as never;
+    await useNewThreadHandler()({
+      environmentId: "environment-ssh",
+      projectId: "project-shared",
+    } as never);
+    expect(testState.selectionOverrides).toHaveBeenLastCalledWith(
+      expect.objectContaining({ projectDefaultSelection: configured }),
+    );
+  },
+);
 
 describe.each([
   ["new", null],
@@ -318,27 +396,115 @@ describe.each([
 });
 
 describe("useNewThreadHandler", () => {
-  it("keeps the text of a draft that gained some while it waited", async () => {
+  it.each([undefined, "codex-shared"] as const)(
+    "waits for the project before resolving a draft type %s",
+    async (threadType) => {
+      testState.reset(null);
+      testState.delayProject();
+      const pending = useNewThreadHandler()(
+        { environmentId: "environment-ssh", projectId: "project-shared" } as never,
+        threadType === undefined ? {} : { threadType },
+      );
+      expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
+      testState.arriveProject();
+      await pending;
+      expect(testState.draftStore.setLogicalProjectDraftThreadId).toHaveBeenCalledWith(
+        "remote-project",
+        expect.anything(),
+        "draft-delayed",
+        expect.objectContaining({ threadType: "codex-shared" }),
+      );
+    },
+  );
+
+  it("does not create a fallback draft when the project load times out", async () => {
     testState.reset(null);
-    const raced = {
-      draftId: "draft-raced",
+    testState.delayProject();
+    const pending = useNewThreadHandler()({
       environmentId: "environment-ssh",
-      promotedTo: null,
-      threadId: "thread-raced",
-    };
-    testState.draftStore.getDraftSessionByLogicalProjectKey
-      .mockReturnValueOnce(null)
-      .mockReturnValueOnce(raced as never);
-    testState.giveUserText("draft-raced");
-
-    const opened = await useNewThreadHandler()(
-      { environmentId: "environment-ssh", projectId: "project-remote" } as never,
-      { prompt: "Read the playbook. " },
-    );
-
-    expect(opened?.draftId).toBe("draft-raced");
-    expect(testState.draftStore.setPrompt).not.toHaveBeenCalled();
+      projectId: "project-shared",
+    } as never);
+    const failed = expect(pending).rejects.toThrow("project load timed out");
+    testState.failProject(new Error("project load timed out"));
+    await failed;
+    expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
+    expect(testState.router.navigate).not.toHaveBeenCalled();
   });
+
+  it("keeps a manual draft type change made while the project was loading", async () => {
+    testState.reset(null);
+    testState.openEmptyDraft("draft-open");
+    testState.changeOpenDraftType("codex-shared");
+    testState.delayProject();
+    const pending = useNewThreadHandler()(
+      { environmentId: "environment-ssh", projectId: "project-shared" } as never,
+      { threadType: "codex-shared" },
+    );
+    testState.changeOpenDraftType("t3");
+    testState.arriveProject();
+    await expect(pending).resolves.toBeNull();
+    expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
+    expect(testState.router.navigate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["project-shared", undefined, "codex-shared"],
+    ["project-shared", "t3", "t3"],
+    ["project-remote", undefined, "t3"],
+    ["project-remote", "codex-shared", "codex-shared"],
+  ] as const)(
+    "uses the requested project %s and type %s",
+    async (projectId, requestedType, expectedType) => {
+      testState.reset(null);
+      const projectRef = { environmentId: "environment-ssh", projectId } as never;
+      await useNewThreadHandler()(
+        projectRef,
+        requestedType === undefined ? {} : { threadType: requestedType },
+      );
+      expect(testState.draftStore.setLogicalProjectDraftThreadId).toHaveBeenCalledWith(
+        "remote-project",
+        projectRef,
+        "draft-delayed",
+        expect.objectContaining({ threadType: expectedType }),
+      );
+    },
+  );
+
+  it.each(["t3", "codex-shared"] as const)(
+    "keeps raced draft text when requesting type %s",
+    async (threadType) => {
+      testState.reset(null);
+      const raced = {
+        draftId: "draft-raced",
+        environmentId: "environment-ssh",
+        promotedTo: null,
+        threadId: "thread-raced",
+      };
+      testState.draftStore.getDraftSessionByLogicalProjectKey
+        .mockReturnValueOnce(null)
+        .mockReturnValueOnce(raced as never);
+      testState.giveUserText("draft-raced");
+
+      const opened = await useNewThreadHandler()(
+        { environmentId: "environment-ssh", projectId: "project-remote" } as never,
+        { prompt: "Read the playbook. ", threadType },
+      );
+
+      expect(opened?.draftId).toBe(threadType === "t3" ? "draft-raced" : "draft-delayed");
+      expect(testState.draftStore.setPrompt).not.toHaveBeenCalledWith(
+        "draft-raced",
+        expect.anything(),
+      );
+      if (threadType === "codex-shared") {
+        expect(testState.draftStore.setLogicalProjectDraftThreadId).toHaveBeenCalledWith(
+          "remote-project",
+          expect.anything(),
+          "draft-delayed",
+          expect.objectContaining({ threadType }),
+        );
+      }
+    },
+  );
 
   it("seeds the prompt into the empty draft that is already open", async () => {
     testState.reset(null);

@@ -1,3 +1,4 @@
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
@@ -583,6 +584,7 @@ function codexReplayPreamble(input: {
   readonly prompt: string;
   readonly sentPrompt?: string;
   readonly effort?: string;
+  readonly sharedNativeOwner?: boolean;
 }): Array<CodexReplay.CodexAppServerReplayEntry> {
   return [
     {
@@ -623,7 +625,12 @@ function codexReplayPreamble(input: {
       frame: {
         id: 2,
         method: "thread/start",
-        params: { config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+        params: {
+          config: {
+            ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+            ...(input.sharedNativeOwner ? { thread_unload_delay_secs: 0 } : {}),
+          },
+        },
       },
     },
     {
@@ -890,65 +897,96 @@ describe("CodexAdapterV2 process exit", () => {
     ),
   );
 
-  it.effect("counts the app-server as a running agent until its session closes", () => {
-    let runningAgents = 0;
-    const factoryLayer = CodexAdapterV2.layerAppServerClientFactory.pipe(
-      Layer.provide(
-        Layer.mock(PortScanner.PortDiscovery)({
-          trackAgent: () => {
-            runningAgents += 1;
-            return () => {
-              runningAgents -= 1;
-            };
-          },
-        }),
-      ),
-      Layer.provide(
-        Layer.succeed(ProviderEventLoggers.ProviderEventLoggers, {
-          native: undefined,
-          canonical: undefined,
-        }),
-      ),
-      Layer.provide(
-        Layer.succeed(
-          ChildProcessSpawner.ChildProcessSpawner,
-          ChildProcessSpawner.make(() =>
-            Effect.succeed(
-              ChildProcessSpawner.makeHandle({
-                pid: ChildProcessSpawner.ProcessId(999_999_999),
-                exitCode: Effect.never,
-                isRunning: Effect.succeed(true),
-                kill: () => Effect.void,
-                unref: Effect.succeed(Effect.void),
-                stdin: Sink.drain,
-                stdout: Stream.never,
-                stderr: Stream.empty,
-                all: Stream.empty,
-                getInputFd: () => Sink.drain,
-                getOutputFd: () => Stream.empty,
-              }),
+  it.effect.each([false, true])(
+    "keeps the app-server lifetime and optional direct title identity (%s)",
+    (direct) => {
+      let runningAgents = 0;
+      const factoryLayer = CodexAdapterV2.layerAppServerClientFactory.pipe(
+        Layer.provide(
+          Layer.mock(PortScanner.PortDiscovery)({
+            trackAgent: () => {
+              runningAgents += 1;
+              return () => {
+                runningAgents -= 1;
+              };
+            },
+          }),
+        ),
+        Layer.provide(
+          Layer.succeed(ProviderEventLoggers.ProviderEventLoggers, {
+            native: undefined,
+            canonical: undefined,
+          }),
+        ),
+        Layer.provide(
+          Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make((command) =>
+              Effect.succeed(
+                ChildProcessSpawner.makeHandle({
+                  pid: ChildProcessSpawner.ProcessId(999_999_999),
+                  exitCode:
+                    command._tag === "StandardCommand" && command.command === "reg.exe"
+                      ? Effect.succeed(ChildProcessSpawner.ExitCode(0))
+                      : Effect.never,
+                  isRunning: Effect.succeed(true),
+                  kill: () => Effect.void,
+                  unref: Effect.succeed(Effect.void),
+                  stdin: Sink.drain,
+                  stdout:
+                    command._tag === "StandardCommand" && command.command === "reg.exe"
+                      ? Stream.make(
+                          new TextEncoder().encode(
+                            "MachineGuid    REG_SZ    12345678-1234-1234-1234-123456789012",
+                          ),
+                        )
+                      : Stream.never,
+                  stderr: Stream.empty,
+                  all: Stream.empty,
+                  getInputFd: () => Sink.drain,
+                  getOutputFd: () => Stream.empty,
+                }),
+              ),
             ),
           ),
         ),
-      ),
-    );
-    return Effect.gen(function* () {
-      const factory = yield* CodexAdapterV2.CodexAppServerClientFactory;
-      yield* Effect.scoped(
-        factory
-          .open({
-            instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
-            threadId: ThreadId.make("thread-codex-agent"),
-            providerSessionId: ProviderSessionId.make("session-codex-agent"),
-            runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
-            settings: DEFAULT_CODEX_SETTINGS,
-            environment: {},
-          })
-          .pipe(Effect.tap(() => Effect.sync(() => assert.equal(runningAgents, 1)))),
       );
-      assert.equal(runningAgents, 0);
-    }).pipe(Effect.provide(factoryLayer));
-  });
+      return Effect.gen(function* () {
+        const factory = yield* CodexAdapterV2.CodexAppServerClientFactory;
+        yield* Effect.scoped(
+          factory
+            .open({
+              instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+              threadId: ThreadId.make("thread-codex-agent"),
+              providerSessionId: ProviderSessionId.make("session-codex-agent"),
+              runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+              settings: {
+                ...DEFAULT_CODEX_SETTINGS,
+                binaryPath: direct ? "C:/Fixture/codex.exe" : "codex",
+              },
+              environment: {},
+            })
+            .pipe(
+              Effect.tap((client) =>
+                Effect.gen(function* () {
+                  assert.equal(runningAgents, 1);
+                  const identity = client.titleProcess ? yield* client.titleProcess : undefined;
+                  if (direct) {
+                    assert.equal(identity?.pid, 999_999_999);
+                    assert.equal(identity?.hostKey.length, 64);
+                  } else assert.isUndefined(identity);
+                  assert.equal(
+                    (client.titleHostKey ? yield* client.titleHostKey : undefined)?.length,
+                    64,
+                  );
+                }),
+              ),
+            ),
+        );
+        assert.equal(runningAgents, 0);
+      }).pipe(Effect.provide(factoryLayer), Effect.provideService(HostProcess.Platform, "win32"));
+    },
+  );
 });
 
 describe("CodexAdapterV2 session initialize", () => {
@@ -1239,6 +1277,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     beforeEmitInbound?: CodexReplay.CodexAppServerReplayDriver["beforeEmitInbound"],
     onUsageLimits?: CodexAdapterV2.CodexAdapterV2Options["onUsageLimits"],
     promptSuggestions: Effect.Effect<boolean> = Effect.succeed(false),
+    codexSharedOwner?: "native",
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -1315,6 +1354,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         modelSelection: CODEX_TEST_MODEL_SELECTION,
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
         promptSuggestions,
+        ...(codexSharedOwner === undefined ? {} : { codexSharedOwner }),
       });
       const providerThread = yield* runtime.ensureThread({
         threadId,
@@ -1662,72 +1702,80 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
-  it.effect("adds the session MCP server without replacing launch-argument servers", () =>
-    Effect.gen(function* () {
-      const scenario = "launch-mcp-servers";
-      yield* (yield* McpProviderSessions.McpProviderSessions).set({
-        environmentId: EnvironmentId.make("environment-codex-mcp"),
-        threadId: ThreadId.make(`thread-${scenario}`),
-        providerSessionId: `provider-session-${scenario}`,
-        providerInstanceId: ProviderInstanceId.make("codex"),
-        endpoint: "http://127.0.0.1:43123/mcp",
-        authorizationHeader: "Bearer secret-codex-token",
-        browserToolsAvailable: true,
-      });
-      const requests: Array<unknown> = [];
-      yield* makeCodexReplayHarness(
-        makeCodexReplayTranscript({
-          scenario,
-          entries: codexReplayPreamble({
-            nativeThreadId: "launch-mcp-thread",
-            nativeTurnId: "unused",
-            prompt: "unused",
-          }).slice(0, 5),
-        }),
-        () => Effect.void,
-        (method, params) =>
-          Effect.sync(() => {
-            if (method === "thread/start") requests.push(params);
+  it.effect.each([undefined, "native"] as const)(
+    "adds the session MCP server and scopes unload config to shared native owners (%s)",
+    (codexSharedOwner) =>
+      Effect.gen(function* () {
+        const scenario = `launch-mcp-servers-${codexSharedOwner ?? "ordinary"}`;
+        yield* (yield* McpProviderSessions.McpProviderSessions).set({
+          environmentId: EnvironmentId.make("environment-codex-mcp"),
+          threadId: ThreadId.make(`thread-${scenario}`),
+          providerSessionId: `provider-session-${scenario}`,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: "Bearer secret-codex-token",
+          browserToolsAvailable: true,
+        });
+        const requests: Array<unknown> = [];
+        yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario,
+            entries: codexReplayPreamble({
+              nativeThreadId: "launch-mcp-thread",
+              sharedNativeOwner: codexSharedOwner === "native",
+              nativeTurnId: "unused",
+              prompt: "unused",
+            }).slice(0, 5),
           }),
-      );
-      assert.deepEqual(requests, [
-        {
-          cwd: "/workspace",
-          model: "gpt-5.4",
-          config: {
-            "tools.update_plan.enabled": true,
-            mcp_optional_startup_grace_ms: 10_000,
-            "features.concurrent_reasoning_summaries": true,
-            "shell_environment_policy.set.T3CODE_THREAD_ID": `thread-${scenario}`,
-            "mcp_servers.t3-code": {
-              url: "http://127.0.0.1:43123/mcp",
-              tool_timeout_sec: 3_900,
-              http_headers: { Authorization: "Bearer secret-codex-token" },
-              disabled_tools: ["t3_thread_wait"],
-            },
-            "mcp_servers.t3-code-direct": {
-              url: "http://127.0.0.1:43123/mcp",
-              tool_timeout_sec: 3_900,
-              http_headers: { Authorization: "Bearer secret-codex-token" },
-              enabled_tools: ["t3_thread_wait"],
-              omit_tools_from: ["code_mode", "deferred"],
+          () => Effect.void,
+          (method, params) =>
+            Effect.sync(() => {
+              if (method === "thread/start") requests.push(params);
+            }),
+          undefined,
+          undefined,
+          undefined,
+          Effect.succeed(false),
+          codexSharedOwner,
+        );
+        assert.deepEqual(requests, [
+          {
+            cwd: "/workspace",
+            model: "gpt-5.4",
+            config: {
+              "tools.update_plan.enabled": true,
+              mcp_optional_startup_grace_ms: 10_000,
+              "features.concurrent_reasoning_summaries": true,
+              ...(codexSharedOwner === "native" ? { thread_unload_delay_secs: 0 } : {}),
+              "shell_environment_policy.set.T3CODE_THREAD_ID": `thread-${scenario}`,
+              "mcp_servers.t3-code": {
+                url: "http://127.0.0.1:43123/mcp",
+                tool_timeout_sec: 3_900,
+                http_headers: { Authorization: "Bearer secret-codex-token" },
+                disabled_tools: ["t3_thread_wait"],
+              },
+              "mcp_servers.t3-code-direct": {
+                url: "http://127.0.0.1:43123/mcp",
+                tool_timeout_sec: 3_900,
+                http_headers: { Authorization: "Bearer secret-codex-token" },
+                enabled_tools: ["t3_thread_wait"],
+                omit_tools_from: ["code_mode", "deferred"],
+              },
             },
           },
-        },
-      ]);
-    }).pipe(
-      Effect.scoped,
-      Effect.provide(
-        Layer.mergeAll(
-          IdAllocator.layer,
-          McpProviderSessions.layer,
-          NodeServices.layer,
-          NodeCrypto.layer,
+        ]);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
         ),
       ),
-    ),
   );
-
   // regression: #15839 launch-arg MCP servers survive the thread's t3-code server
   it.effect("replays historical and dotted MCP config while enforcing other thread config", () =>
     Effect.gen(function* () {
@@ -3033,23 +3081,38 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   it.effect.each(
     (
       [
-        ["recovers archived-session errors", "session saved-thread is archived", 0, ""],
-        ["preserves missing-thread errors", "thread not found", 3, "thread not found"],
+        ["recovers archived-session errors", "session saved-thread is archived", 0, "", false],
+        ["preserves missing-thread errors", "thread not found", 3, "thread not found", false],
+        [
+          "preserves a shared conversation archived in another client",
+          "session saved-thread is archived",
+          3,
+          "session saved-thread is archived",
+          true,
+        ],
         [
           "propagates unarchive missing-thread errors",
           "session saved-thread is archived",
           4,
           "thread not found",
+          false,
         ],
         [
           "does not retry archived errors twice",
           "session saved-thread is archived",
           5,
           "session saved-thread is archived",
+          false,
         ],
       ] as const
-    ).map(([name, resumeError, failAt, finalError]) => ({ name, resumeError, failAt, finalError })),
-  )("$name", ({ name, resumeError, failAt, finalError }) =>
+    ).map(([name, resumeError, failAt, finalError, shared]) => ({
+      name,
+      resumeError,
+      failAt,
+      finalError,
+      shared,
+    })),
+  )("$name", ({ name, resumeError, failAt, finalError, shared }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const nativeThreadId = "saved-thread";
@@ -3124,7 +3187,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           makeCodexReplayTranscript({ scenario: name, entries }),
         );
         const resume = harness.runtime.resumeThread({
-          providerThread: harness.providerThread,
+          providerThread: {
+            ...harness.providerThread,
+            ...(shared ? { nativeMetadata: { codexShared: true as const } } : {}),
+          },
           modelSelection: CODEX_TEST_MODEL_SELECTION,
           runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
         });
@@ -9771,6 +9837,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     const startApprovalTurn = (
       scenario: string,
       entries: ReadonlyArray<CodexReplay.CodexAppServerReplayEntry>,
+      decision: ProviderApprovalDecision = "accept",
     ) =>
       Effect.gen(function* () {
         const pending = yield* Queue.unbounded<OrchestrationV2RuntimeRequest>();
@@ -9799,7 +9866,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             Effect.tap((request) =>
               harness.runtime.respondToRuntimeRequest({
                 requestId: request.id,
-                decision: "accept",
+                decision,
               }),
             ),
           ),
@@ -9938,70 +10005,130 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
     );
 
-    it.effect("classifies permission requests that only list sandbox entries", () =>
-      Effect.gen(function* () {
-        const permissionRequest = (
-          id: number,
-          itemId: string,
-          entries: CodexSchema.PermissionsRequestApprovalParams__AdditionalFileSystemPermissions["entries"],
-        ): Array<CodexReplay.CodexAppServerReplayEntry> => [
-          {
-            type: "emit_inbound",
-            label: `permissions ${itemId}`,
-            frame: {
-              id,
-              method: "item/permissions/requestApproval",
-              params: {
-                threadId: nativeThreadId,
-                turnId: nativeTurnId,
-                itemId,
-                cwd: "/w",
-                startedAtMs: 2,
-                permissions: { fileSystem: { entries } },
+    it.effect.each(["accept", "acceptForSession", "decline"] as const)(
+      "shows structured permission grants and their scope before %s",
+      (decision) =>
+        Effect.gen(function* () {
+          const permissionRequest = (
+            id: number,
+            itemId: string,
+            permissions: CodexSchema.PermissionsRequestApprovalParams["permissions"],
+            reason?: string,
+          ): Array<CodexReplay.CodexAppServerReplayEntry> => [
+            {
+              type: "emit_inbound",
+              label: `permissions ${itemId}`,
+              frame: {
+                id,
+                method: "item/permissions/requestApproval",
+                params: {
+                  threadId: nativeThreadId,
+                  turnId: nativeTurnId,
+                  itemId,
+                  cwd: "/w",
+                  startedAtMs: 2,
+                  permissions,
+                  ...(reason === undefined ? {} : { reason }),
+                },
               },
             },
-          },
-          {
-            type: "expect_outbound",
-            label: `permissions ${itemId}`,
-            frame: { id, result: { permissions: { fileSystem: { entries } }, scope: "turn" } },
-          },
-        ];
-        const { harness, answerNext } = yield* startApprovalTurn("permission-entries", [
-          ...permissionRequest(0, "write-glob", [
-            { access: "read", path: { type: "path", path: "/w/src" } },
-            { access: "write", path: { type: "glob_pattern", pattern: "/w/out/**" } },
-          ]),
-          ...permissionRequest(1, "read-glob", [
-            { access: "read", path: { type: "glob_pattern", pattern: "/w/docs/**" } },
-          ]),
-          turnCompleted(nativeTurnId),
-        ]);
-        const write = yield* answerNext;
-        const read = yield* answerNext;
-        yield* harness.firstTerminal;
-
-        assert.deepEqual(
-          [write, read].map((request) => [
-            request.kind,
-            approvalItem(harness.events, request)?.requestKind,
-          ]),
-          [
-            ["file-change", "file-change"],
-            ["file-read", "file-read"],
-          ],
-        );
-      }).pipe(
-        Effect.scoped,
-        Effect.provide(
-          Layer.mergeAll(
-            IdAllocator.layer,
-            McpProviderSessions.layer,
-            NodeServices.layer,
-            NodeCrypto.layer,
+            {
+              type: "expect_outbound",
+              label: `permissions ${itemId}`,
+              frame: {
+                id,
+                result: {
+                  permissions: decision === "decline" ? {} : permissions,
+                  scope: decision === "acceptForSession" ? "session" : "turn",
+                },
+              },
+            },
+          ];
+          const samples: Array<{
+            id: string;
+            kind: string;
+            permissions: CodexSchema.PermissionsRequestApprovalParams["permissions"];
+            reason?: string;
+          }> = [
+            {
+              id: "write-glob",
+              kind: "file-change",
+              permissions: {
+                fileSystem: {
+                  entries: [
+                    { access: "read", path: { type: "path", path: "/w/src" } },
+                    { access: "write", path: { type: "glob_pattern", pattern: "/w/out/**" } },
+                  ],
+                },
+              },
+              reason: "Write the output",
+            },
+            {
+              id: "read-glob",
+              kind: "file-read",
+              permissions: {
+                fileSystem: {
+                  entries: [
+                    { access: "read", path: { type: "glob_pattern", pattern: "/w/docs/**" } },
+                  ],
+                },
+              },
+            },
+            {
+              id: "network",
+              kind: "command",
+              permissions: { network: { enabled: true } },
+              reason: "Contact a service",
+            },
+            {
+              id: "mixed",
+              kind: "file-change",
+              permissions: {
+                network: { enabled: true },
+                fileSystem: { read: ["/w/source"], write: ["/w/output"] },
+              },
+            },
+          ];
+          const { harness, answerNext } = yield* startApprovalTurn(
+            `permission-entries-${decision}`,
+            [
+              ...samples.flatMap((sample, id) =>
+                permissionRequest(id, sample.id, sample.permissions, sample.reason),
+              ),
+              turnCompleted(nativeTurnId),
+            ],
+            decision,
+          );
+          for (const sample of samples) {
+            const request = yield* answerNext;
+            const item = approvalItem(harness.events, request);
+            assert.equal(request.kind, sample.kind);
+            assert.equal(item?.requestKind, sample.kind);
+            assert.isString(item?.prompt);
+            if (sample.reason) assert.isTrue(item!.prompt!.startsWith(`${sample.reason}\n\n`));
+            assert.deepEqual(
+              JSON.parse(item!.prompt!.split("Requested permissions:\n")[1]!),
+              sample.permissions,
+            );
+            assert.deepEqual(item?.options, [
+              { decision: "accept", label: "Allow for this turn" },
+              { decision: "acceptForSession", label: "Allow for this session" },
+              { decision: "decline", label: "Decline" },
+              { decision: "cancel", label: "Cancel" },
+            ]);
+          }
+          yield* harness.firstTerminal;
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
           ),
         ),
-      ),
     );
   });
 });

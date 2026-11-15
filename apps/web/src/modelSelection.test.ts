@@ -2,6 +2,7 @@ import {
   ANTIGRAVITY_DEFAULT_MODEL,
   DEFAULT_TEXT_GENERATION_MODEL,
   DEFAULT_SERVER_SETTINGS,
+  CODEX_DESKTOP_CATALOG_UNAVAILABLE,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -16,6 +17,8 @@ import { describe, expect, it } from "vite-plus/test";
 import { createModelSelection } from "@t3tools/shared/model";
 import { deriveEffectiveComposerModelState } from "./composerDraftStore";
 import { getComposerProviderState } from "./components/chat/composerProviderState";
+import { resolveMultipleModelTargets } from "./components/chat/chatViewSend";
+import { getSharedCodexModelBlockReason } from "./providerModels";
 import { resolveComposerProviderSelection } from "./components/ChatView.logic";
 import {
   deriveProviderInstanceEntries,
@@ -951,6 +954,108 @@ describe("default model settings and new-thread composer parity", () => {
       expect(traits(effective.model, effective.options)).toEqual(composerTraits);
       expect(effective).toEqual({ ...stored, model: composer.selectedModel });
       expect(composerTraits.promptEffort).toBe(effort);
+    },
+  );
+});
+
+describe("shared Codex candidate catalog recovery", () => {
+  it.each(["thread", "draft"] as const)(
+    "keeps the %s selection and options across missing, empty and restored catalogs",
+    (source) => {
+      const instanceId = ProviderInstanceId.make("codex-desktop");
+      const driver = ProviderDriverKind.make("codex");
+      const saved = createModelSelection(instanceId, "shared-model-a", [
+        { id: "effort", value: "high" },
+        { id: "serviceTier", value: "default" },
+      ]);
+      const original = JSON.stringify(saved);
+      let seenEmpty = false;
+      for (const missing of [true, true, false]) {
+        const models: Array<ServerProvider["models"][number]> = missing
+          ? []
+          : [
+              {
+                slug: saved.model,
+                name: saved.model,
+                isCustom: false,
+                capabilities: {
+                  optionDescriptors: [
+                    {
+                      id: "effort",
+                      label: "Effort",
+                      type: "select",
+                      options: [{ id: "high", label: "High" }],
+                    },
+                    {
+                      id: "serviceTier",
+                      label: "Service tier",
+                      type: "select",
+                      options: [{ id: "default", label: "Standard" }],
+                    },
+                  ],
+                },
+              },
+            ];
+        // First iteration represents a refresh which retained other candidates; second is empty.
+        if (missing && !models.length && !seenEmpty)
+          models.push({ slug: "shared-model-b", name: "B", isCustom: false, capabilities: {} });
+        seenEmpty = missing;
+        const snapshot: ServerProvider = {
+          ...provider({ provider: driver, instanceId }),
+          models,
+          codexDesktopCatalog: CODEX_DESKTOP_CATALOG_UNAVAILABLE,
+        };
+        const providers = [snapshot];
+        const draft =
+          source === "draft"
+            ? { activeProvider: instanceId, modelSelectionByProvider: { [instanceId]: saved } }
+            : null;
+        const state = deriveEffectiveComposerModelState({
+          draft,
+          providers,
+          selectedProvider: driver,
+          selectedInstanceId: instanceId,
+          threadModelSelection: saved,
+          projectModelSelection: null,
+          settings: settingsWithProviderInstances(),
+        });
+        const composer = getComposerProviderState({
+          provider: driver,
+          model: state.selectedModel,
+          models,
+          modelOptions: state.modelOptions?.[instanceId],
+          codexDesktopCatalog: snapshot.codexDesktopCatalog,
+        });
+        const selection = createModelSelection(
+          instanceId,
+          state.selectedModel,
+          composer.modelOptionsForDispatch,
+        );
+        expect(selection).toEqual(saved);
+        expect(JSON.stringify(saved)).toBe(original);
+        const entries = deriveProviderInstanceEntries(providers);
+        const options = getAppModelOptionsForInstance(
+          settingsWithProviderInstances(),
+          entries[0]!,
+          state.selectedModel,
+        );
+        expect(options.find((option) => option.slug === saved.model)?.isUnavailable ?? false).toBe(
+          missing,
+        );
+        expect(getSharedCodexModelBlockReason(snapshot, state.selectedModel) !== null).toBe(
+          missing,
+        );
+        const targets = resolveMultipleModelTargets({
+          selections: [selection],
+          providerInstanceEntries: entries,
+          messageText: "test only",
+        });
+        if (missing)
+          expect(targets).toEqual([
+            { error: expect.stringContaining("missing from T3's candidate catalog") },
+          ]);
+        else expect(targets).toEqual([{ selection: saved, text: "test only" }]);
+      }
     },
   );
 });

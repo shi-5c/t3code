@@ -1,4 +1,5 @@
 import {
+  codexSharedOwnerOf,
   ModelSelection,
   OrchestrationV2ThreadProjection,
   ProviderSessionId,
@@ -92,6 +93,25 @@ export const layer: Layer.Layer<
           const currentSession = currentSessions.find(isLiveProviderSession);
           const negotiatedCapabilities =
             currentSession?.capabilities ?? currentSessions[0]?.capabilities;
+          // A multiplexed process cwd belongs to its first opener, not every thread.
+          // This command changes model options; the thread's workspace stays fixed.
+          const currentWorkspace = negotiatedCapabilities?.sessions
+            .supportsMultipleProviderThreadsPerSession
+            ? (projection.thread.worktreePath ?? currentSession?.cwd)
+            : (currentSession?.cwd ?? projection.thread.worktreePath);
+          if (
+            codexSharedOwnerOf(projection.thread) === "desktop" &&
+            currentSession?.cwd != null &&
+            projection.thread.worktreePath != null &&
+            currentSession.cwd !== projection.thread.worktreePath
+          ) {
+            return yield* new ProviderSwitchPlanError({
+              threadId: projection.thread.id,
+              targetProviderInstanceId: targetModelSelection.instanceId,
+              cause:
+                "The Desktop owner uses a different workspace. Reconnect this chat before changing model settings.",
+            });
+          }
           const currentProviderThread = projection.providerThreads.find(
             (thread) =>
               thread.id === projection.thread.activeProviderThreadId &&
@@ -130,10 +150,7 @@ export const layer: Layer.Layer<
                           modelSelection: current,
                           runtimeMode: projection.thread.runtimeMode,
                           interactionMode: projection.thread.interactionMode,
-                          workspace:
-                            currentSession?.cwd ??
-                            projection.thread.worktreePath ??
-                            "<unresolved-workspace>",
+                          workspace: currentWorkspace ?? "<unresolved-workspace>",
                         },
                   target: {
                     driver: targetInstance.value.driver,

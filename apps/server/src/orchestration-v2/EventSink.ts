@@ -100,7 +100,7 @@ export interface EventSinkV2Shape {
     readonly unlessNativeThreadOwned?: Pick<
       OrchestrationV2ProviderThread,
       "driver" | "providerInstanceId" | "appThreadId" | "nativeThreadRef"
-    >;
+    > & { readonly anyProviderInstance?: boolean };
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
@@ -114,7 +114,7 @@ export interface EventSinkV2Shape {
     readonly unlessNativeThreadOwned?: Pick<
       OrchestrationV2ProviderThread,
       "driver" | "providerInstanceId" | "appThreadId" | "nativeThreadRef"
-    >;
+    > & { readonly anyProviderInstance?: boolean };
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
@@ -155,6 +155,7 @@ export interface EventSinkV2Shape {
   /** Commits only if the full provider row equals expected; some writers do not advance updatedAt. */
   readonly writeIfProviderThreadUnchanged: (input: {
     readonly expected: OrchestrationV2ProviderThread;
+    readonly expectedSharedTitle?: { readonly title: string; readonly version: number };
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<
     {
@@ -365,19 +366,29 @@ const layerBase: Layer.Layer<
             : [],
         ),
       );
-      return Effect.forEach(
-        events,
-        (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
-          event.type === "turn-item.updated"
-            ? turnItemPositions
-                .normalize(
-                  event.payload,
-                  event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
-                )
-                .pipe(Effect.map((payload) => ({ ...event, payload })))
-            : Effect.succeed(event),
-        { concurrency: 1 },
-      );
+      return turnItemPositions
+        .reconcileNativeHistory(
+          events.flatMap((event) => (event.type === "turn-item.updated" ? [event.payload] : [])),
+        )
+        .pipe(
+          Effect.andThen(
+            Effect.forEach(
+              events,
+              (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
+                event.type === "turn-item.updated"
+                  ? turnItemPositions
+                      .normalize(
+                        event.payload,
+                        event.payload.runId === null
+                          ? undefined
+                          : runOrdinals.get(event.payload.runId),
+                      )
+                      .pipe(Effect.map((payload) => ({ ...event, payload })))
+                  : Effect.succeed(event),
+              { concurrency: 1 },
+            ),
+          ),
+        );
     };
 
     const applyStoredEvents =
@@ -451,11 +462,15 @@ const layerBase: Layer.Layer<
           // Check ownership in the same transaction that claims the native session.
           const imported = input.unlessNativeThreadOwned;
           if (imported?.nativeThreadRef != null) {
+            const instanceFilter =
+              imported.anyProviderInstance === true
+                ? sql``
+                : sql`AND provider_instance_id = ${imported.providerInstanceId}`;
             const owners = yield* sql`
               SELECT provider_thread_id
               FROM orchestration_v2_projection_provider_threads
               WHERE driver = ${imported.driver}
-                AND provider_instance_id = ${imported.providerInstanceId}
+                ${instanceFilter}
                 AND thread_id IS NOT ${imported.appThreadId}
                 AND json_extract(payload_json, '$.nativeThreadRef.nativeId') = ${imported.nativeThreadRef.nativeId}
               LIMIT 1
@@ -632,6 +647,32 @@ const layerBase: Layer.Layer<
               committed: false as const,
               storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
             };
+          }
+
+          if (input.expectedSharedTitle) {
+            const titles = yield* sql<{
+              readonly title: string;
+              readonly version: number;
+              readonly owner: string | null;
+              readonly active: string | null;
+            }>`
+              SELECT title, COALESCE(json_extract(payload_json, '$.codexTitleSync.version'), 0) AS version,
+                json_extract(payload_json, '$.codexSharedOwner') AS owner,
+                active_provider_thread_id AS active
+              FROM orchestration_v2_projection_threads WHERE thread_id = ${input.expected.appThreadId}
+            `;
+            const title = titles[0];
+            if (
+              !title ||
+              title.title !== input.expectedSharedTitle.title ||
+              title.version !== input.expectedSharedTitle.version ||
+              title.owner === "desktop" ||
+              title.active !== input.expected.id
+            )
+              return {
+                committed: false as const,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+              };
           }
 
           const normalized = yield* normalizeEvents(input.events);

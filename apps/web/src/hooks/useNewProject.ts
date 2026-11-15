@@ -7,7 +7,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, ThreadType } from "@t3tools/contracts";
 
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { waitForProject } from "~/state/entities";
@@ -70,11 +70,17 @@ export function useNewProject() {
   return async (input: {
     readonly environmentId: EnvironmentId;
     readonly name: string;
+    readonly defaultThreadType?: ThreadType;
     readonly publishTo: NewProjectPublishTarget | null;
   }): Promise<boolean> => {
     const result = await createNew({
       environmentId: input.environmentId,
-      input: { name: input.name },
+      input: {
+        name: input.name,
+        ...(input.defaultThreadType === undefined
+          ? {}
+          : { defaultThreadType: input.defaultThreadType }),
+      },
     });
     if (result._tag === "Failure") {
       if (!isAtomCommandInterrupted(result)) {

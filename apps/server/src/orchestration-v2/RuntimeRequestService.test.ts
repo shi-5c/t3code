@@ -2,6 +2,7 @@ import { assert, it, vi } from "@effect/vitest";
 import {
   NodeId,
   ProviderSessionId,
+  ProviderDriverKind,
   RuntimeRequestId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
@@ -95,6 +96,60 @@ it.effect.each(["expired", "resolved"] as const)(
       assert.isUndefined(error.cause);
       assert.equal(getSession.mock.calls.length, 0);
       assert.equal(respondToRuntimeRequest.mock.calls.length, 0);
+    }).pipe(Effect.provide(layerTest));
+  },
+);
+
+it.effect.each(["codex-desktop", "codex"] as const)(
+  "executes pending owner requests only through the reserved Desktop instance (%s)",
+  (instanceId) => {
+    const threadId = ThreadId.make("desktop-test");
+    const providerSessionId = ProviderSessionId.make("desktop-session:test");
+    const requestId = RuntimeRequestId.make("desktop-request");
+    const respond = vi.fn(() => Effect.void);
+    const layerTest = RuntimeRequestService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRuntimeRequest: () =>
+              Effect.succeed({
+                id: requestId,
+                nodeId: NodeId.make("node"),
+                providerTurnId: null,
+                nativeRequestRef: {
+                  driver: ProviderDriverKind.make("codex"),
+                  nativeId: "request",
+                  strength: "strong",
+                },
+                kind: "user_input",
+                status: "pending",
+                responseCapability: { type: "live", providerSessionId, supportsFeedback: false },
+                createdAt: DateTime.makeUnsafe(1000),
+                resolvedAt: null,
+              }),
+          }),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+            get: () =>
+              Effect.succeedSome({ instanceId, respondToRuntimeRequest: respond } as never),
+          }),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      const service = yield* RuntimeRequestService.RuntimeRequestServiceV2;
+      const effect = service.respond({
+        threadId,
+        providerSessionId,
+        requestId,
+        answers: { q: "A" },
+      });
+      if (instanceId === "codex-desktop") {
+        yield* effect;
+        assert.equal(respond.mock.calls.length, 1);
+      } else {
+        assert.equal((yield* effect.pipe(Effect.flip)).reason, "request-not-ready");
+        assert.equal(respond.mock.calls.length, 0);
+      }
     }).pipe(Effect.provide(layerTest));
   },
 );

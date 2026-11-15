@@ -8,6 +8,7 @@ import {
   type ProjectScript,
   SCRIPT_RUN_COMMAND_PATTERN,
   type ThreadEnvMode,
+  type ThreadType,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Result from "effect/Result";
@@ -17,6 +18,7 @@ import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventS
 import type { ProjectRow } from "./ProjectStore.ts";
 
 export interface ProjectCreateCommand {
+  readonly defaultThreadType?: ThreadType;
   readonly type: "project.create";
   readonly commandId: CommandId;
   readonly projectId: ProjectId;
@@ -26,6 +28,7 @@ export interface ProjectCreateCommand {
 }
 
 export interface ProjectMetaUpdateCommand {
+  readonly defaultThreadType?: ThreadType;
   readonly type: "project.meta.update";
   readonly commandId: CommandId;
   readonly projectId: ProjectId;
@@ -160,6 +163,7 @@ export function planProjectCommand(input: {
           title: command.title,
           workspaceRoot: command.workspaceRoot,
           defaultModelSelection: null,
+          defaultThreadType: command.defaultThreadType ?? "t3",
           faviconPath: null,
           projectIcon: null,
           scripts: command.scripts ?? [],
@@ -199,6 +203,9 @@ export function planProjectCommand(input: {
         payload: {
           projectId: command.projectId,
           ...(command.title === undefined ? {} : { title: command.title }),
+          ...(command.defaultThreadType === undefined
+            ? {}
+            : { defaultThreadType: command.defaultThreadType }),
           ...(command.workspaceRoot === undefined ? {} : { workspaceRoot: command.workspaceRoot }),
           ...(command.defaultModelSelection === undefined
             ? {}

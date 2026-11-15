@@ -25,6 +25,7 @@ import {
   type ScopedProjectRef,
   type ScopedThreadRef,
   ThreadId,
+  ThreadType,
   SnapShotSource,
 } from "@t3tools/contracts";
 import {
@@ -314,6 +315,7 @@ const PersistedDraftThreadState = Schema.Struct({
   loadBalancedEnvironmentId: Schema.optionalKey(Schema.NullOr(Schema.String)),
   createdAt: Schema.String,
   runtimeMode: RuntimeMode,
+  threadType: Schema.optionalKey(ThreadType),
   interactionMode: ProviderInteractionMode,
   branch: Schema.NullOr(Schema.String),
   worktreePath: Schema.NullOr(Schema.String),
@@ -399,6 +401,7 @@ export function composerDraftHasUserContent(
 }
 
 export interface DraftSessionState {
+  threadType?: ThreadType;
   threadId: ThreadId;
   environmentId: EnvironmentId;
   projectId: ProjectId;
@@ -462,6 +465,7 @@ interface ComposerDraftStoreState {
       createdAt?: string;
       envMode?: DraftThreadEnvMode;
       startFromOrigin?: boolean;
+      threadType?: ThreadType;
       runtimeMode?: RuntimeMode;
       interactionMode?: ProviderInteractionMode;
       environmentSelection?: "auto" | "manual";
@@ -478,6 +482,7 @@ interface ComposerDraftStoreState {
       createdAt?: string;
       envMode?: DraftThreadEnvMode;
       startFromOrigin?: boolean;
+      threadType?: ThreadType;
       runtimeMode?: RuntimeMode;
       interactionMode?: ProviderInteractionMode;
       environmentSelection?: "auto" | "manual";
@@ -493,6 +498,7 @@ interface ComposerDraftStoreState {
       createdAt?: string;
       envMode?: DraftThreadEnvMode;
       startFromOrigin?: boolean;
+      threadType?: ThreadType;
       runtimeMode?: RuntimeMode;
       interactionMode?: ProviderInteractionMode;
       environmentSelection?: "auto" | "manual";
@@ -1479,6 +1485,7 @@ function createDraftThreadState(
     createdAt?: string;
     envMode?: DraftThreadEnvMode;
     startFromOrigin?: boolean;
+    threadType?: ThreadType;
     runtimeMode?: RuntimeMode;
     interactionMode?: ProviderInteractionMode;
     environmentSelection?: "auto" | "manual";
@@ -1523,6 +1530,7 @@ function createDraftThreadState(
           }
         : {}),
     createdAt: options?.createdAt ?? existingThread?.createdAt ?? new Date().toISOString(),
+    threadType: options?.threadType ?? existingThread?.threadType ?? "t3",
     runtimeMode: options?.runtimeMode ?? existingThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE,
     interactionMode:
       options?.interactionMode ?? existingThread?.interactionMode ?? DEFAULT_INTERACTION_MODE,
@@ -1559,6 +1567,7 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
     left.environmentSelection === right.environmentSelection &&
     left.loadBalancedEnvironmentId === right.loadBalancedEnvironmentId &&
     left.createdAt === right.createdAt &&
+    left.threadType === right.threadType &&
     left.runtimeMode === right.runtimeMode &&
     left.interactionMode === right.interactionMode &&
     left.branch === right.branch &&
@@ -1701,6 +1710,7 @@ function normalizePersistedDraftThreads(
           typeof createdAt === "string" && createdAt.length > 0
             ? createdAt
             : new Date().toISOString(),
+        threadType: candidateDraftThread.threadType === "codex-shared" ? "codex-shared" : "t3",
         runtimeMode: isRuntimeMode(candidateDraftThread.runtimeMode)
           ? candidateDraftThread.runtimeMode
           : DEFAULT_RUNTIME_MODE,
@@ -1767,6 +1777,7 @@ function normalizePersistedDraftThreads(
           projectId: projectRef.projectId,
           logicalProjectKey,
           createdAt: new Date().toISOString(),
+          threadType: "t3",
           runtimeMode: DEFAULT_RUNTIME_MODE,
           interactionMode: DEFAULT_INTERACTION_MODE,
           branch: null,
@@ -2471,6 +2482,7 @@ function toHydratedDraftThreadState(
         ),
       ),
     createdAt: persistedDraftThread.createdAt,
+    threadType: persistedDraftThread.threadType ?? "t3",
     runtimeMode: persistedDraftThread.runtimeMode,
     interactionMode: persistedDraftThread.interactionMode,
     branch: persistedDraftThread.branch,
@@ -2761,6 +2773,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                 options.createdAt === undefined
                   ? existing.createdAt
                   : options.createdAt || existing.createdAt,
+              threadType: options.threadType ?? existing.threadType ?? "t3",
               runtimeMode: options.runtimeMode ?? existing.runtimeMode,
               interactionMode: options.interactionMode ?? existing.interactionMode,
               branch: nextBranch,
@@ -2777,6 +2790,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               nextDraftThread.environmentSelection === existing.environmentSelection &&
               nextDraftThread.loadBalancedEnvironmentId === existing.loadBalancedEnvironmentId &&
               nextDraftThread.createdAt === existing.createdAt &&
+              nextDraftThread.threadType === existing.threadType &&
               nextDraftThread.runtimeMode === existing.runtimeMode &&
               nextDraftThread.interactionMode === existing.interactionMode &&
               nextDraftThread.branch === existing.branch &&

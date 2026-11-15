@@ -21,10 +21,64 @@ import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 
 const driver = ProviderDriverKind.make("codex");
 const personalId = ProviderInstanceId.make("codex_personal");
 const workId = ProviderInstanceId.make("codex_work");
+
+it.effect.each(["ready", "disabled", "missing", "uninstalled", "unavailable", "error"] as const)(
+  "admits a new shared session only with a ready reserved instance: %s",
+  (state) => {
+    const id = ProviderInstanceId.make("codex-desktop");
+    const instance = {
+      ...makeInstance(id, {
+        ...makeAdapter(id),
+        getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+      }),
+      enabled: state !== "disabled",
+      snapshot: {
+        resolveMaintenance: () => Effect.die("unused"),
+        refresh: Effect.die("unused"),
+        streamChanges: Stream.empty,
+        applyUsageLimits: () => Effect.void,
+        getSnapshot: Effect.succeed({
+          instanceId: id,
+          driver,
+          enabled: true,
+          installed: state !== "uninstalled",
+          version: null,
+          status: state === "error" ? ("error" as const) : ("ready" as const),
+          availability: state === "unavailable" ? ("unavailable" as const) : ("available" as const),
+          auth: { status: "authenticated" as const },
+          checkedAt: "2026-11-12T00:00:00Z",
+          models: [],
+          slashCommands: [],
+          skills: [],
+        }),
+      } satisfies ProviderInstance["snapshot"],
+    };
+    return Effect.gen(function* () {
+      const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+      const result = yield* registry.getMetadata!(id).pipe(Effect.exit);
+      if (state === "missing") assert.isTrue(Exit.isFailure(result));
+      else {
+        assert.isTrue(Exit.isSuccess(result));
+        if (Exit.isSuccess(result)) assert.strictEqual(result.value.available, state === "ready");
+      }
+    }).pipe(
+      Effect.provide(
+        ProviderAdapterRegistry.layerFromProviderInstanceRegistry.pipe(
+          Layer.provide(
+            Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+              getInstance: () => Effect.succeed(state === "missing" ? undefined : instance),
+            }),
+          ),
+        ),
+      ),
+    );
+  },
+);
 
 const makeAdapter = (
   instanceId: ProviderInstanceId,

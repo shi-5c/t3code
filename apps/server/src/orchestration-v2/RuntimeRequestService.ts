@@ -86,8 +86,12 @@ export const layer: Layer.Layer<
               requestId: input.requestId,
             });
           }
-          // Dispatch persists resolution before this effect runs; pending requests are not executable.
-          if (request.status !== "resolved") {
+          // Desktop keeps responses pending until canonical owner facts arrive.
+          const ownerPending =
+            request.status === "pending" &&
+            String(input.providerSessionId).startsWith("desktop-session:") &&
+            request.nativeRequestRef?.driver === "codex";
+          if (request.status !== "resolved" && !ownerPending) {
             return yield* new RuntimeRequestResponseExecutionError({
               reason: "request-not-ready",
               threadId: input.threadId,
@@ -115,6 +119,13 @@ export const layer: Layer.Layer<
               requestId: input.requestId,
             });
           }
+          if (ownerPending && session.value.instanceId !== "codex-desktop")
+            return yield* new RuntimeRequestResponseExecutionError({
+              reason: "request-not-ready",
+              threadId: input.threadId,
+              providerSessionId: input.providerSessionId,
+              requestId: input.requestId,
+            });
           yield* session.value.respondToRuntimeRequest({
             requestId: input.requestId,
             ...(input.decision === undefined ? {} : { decision: input.decision }),

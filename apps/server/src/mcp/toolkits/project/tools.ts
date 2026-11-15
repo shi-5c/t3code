@@ -1,3 +1,4 @@
+import * as Struct from "effect/Struct";
 import { McpAttachmentInput } from "../attachment/input.ts";
 import {
   NonNegativeInt,
@@ -80,7 +81,7 @@ const ProjectCreateTool = Tool.make("t3_project_create", {
     "Register a project folder. `createWorkspaceRootIfMissing` creates it; a registered folder is rejected. No `workspaceRoot`: makes a git repo from `title` with README, icon, first commit (`commitError` on failure; project still exists). Clone first with `t3_project_clone` if needed.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
-    ...ProjectCreatePayload.fields,
+    ...ProjectCreatePayload.mapFields(Struct.omit(["defaultThreadType"])).fields,
     workspaceRoot: Schema.optional(ProjectCreatePayload.fields.workspaceRoot),
   }),
   success: Schema.Struct({ ...Project.fields, commitError: Schema.optional(Schema.String) }),
@@ -92,7 +93,7 @@ const ProjectUpdateTool = Tool.make("t3_project_update", {
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     projectId: ProjectId,
-    ...ProjectUpdatePayload.fields,
+    ...ProjectUpdatePayload.mapFields(Struct.omit(["defaultThreadType"])).fields,
   }),
 }).annotate(Tool.Destructive, true);
 const ProjectDeleteTool = Tool.make("t3_project_delete", {

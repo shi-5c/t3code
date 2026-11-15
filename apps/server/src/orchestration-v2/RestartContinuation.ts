@@ -47,6 +47,8 @@ function restartContinuationBlocked(
 ): boolean {
   const { thread } = projection;
   if (
+    thread.threadType === "codex-shared" ||
+    thread.providerInstanceId === "codex-desktop" ||
     thread.archivedAt !== null ||
     thread.deletedAt !== null ||
     thread.settledOverride === "settled" ||

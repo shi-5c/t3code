@@ -13,6 +13,7 @@ import {
 } from "./baseSchemas.ts";
 import { RepositoryIdentity, ThreadEnvMode } from "./environment.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import { ThreadType } from "./threadType.ts";
 import type { OrchestrationV2StoredEvent } from "./orchestrationV2.ts";
 import { ProjectScript, StoredProjectIcon } from "./project.ts";
 
@@ -34,6 +35,7 @@ export const ApplicationEventMetadata = Schema.Struct({
 export type ApplicationEventMetadata = typeof ApplicationEventMetadata.Type;
 
 export const ApplicationProjectCreatedPayload = Schema.Struct({
+  defaultThreadType: Schema.optional(ThreadType),
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
   workspaceRoot: TrimmedNonEmptyString,
@@ -49,6 +51,7 @@ export const ApplicationProjectCreatedPayload = Schema.Struct({
 export type ApplicationProjectCreatedPayload = typeof ApplicationProjectCreatedPayload.Type;
 
 export const ApplicationProjectMetaUpdatedPayload = Schema.Struct({
+  defaultThreadType: Schema.optional(ThreadType),
   projectId: ProjectId,
   title: Schema.optional(TrimmedNonEmptyString),
   workspaceRoot: Schema.optional(TrimmedNonEmptyString),

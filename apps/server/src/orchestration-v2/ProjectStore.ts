@@ -7,6 +7,7 @@ import {
   ProjectId,
   ProjectScript,
   ThreadEnvMode,
+  ThreadType,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -30,6 +31,7 @@ export class ProjectStoreV2Error extends Schema.TaggedError<ProjectStoreV2Error>
 }
 
 export const ProjectRow = Schema.Struct({
+  defaultThreadType: Schema.optional(ThreadType),
   projectId: ProjectId,
   title: Schema.String,
   workspaceRoot: Schema.String,
@@ -62,6 +64,7 @@ function toShell(row: ProjectRow): OrchestrationProjectShell {
     workspaceRoot: row.workspaceRoot,
     repositoryIdentity: null,
     defaultModelSelection: row.defaultModelSelection,
+    defaultThreadType: row.defaultThreadType ?? "t3",
     defaultThreadEnvMode: row.defaultThreadEnvMode,
     autoPull: row.autoPull,
     faviconPath: row.faviconPath,
@@ -103,6 +106,11 @@ export class ProjectStoreV2 extends Context.Service<
 /** @public */
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  // Keep fork metadata outside upstream's numbered migration sequence.
+  yield* sql`CREATE TABLE IF NOT EXISTS t3_fork_project_thread_defaults (
+    project_id TEXT PRIMARY KEY,
+    thread_type TEXT NOT NULL CHECK(thread_type IN ('t3', 'codex-shared'))
+  )`.pipe(Effect.orDie);
   const encodeRow = Schema.encodeEffect(ProjectDbRow);
 
   const selectRows = SqlSchema.findAll({
@@ -119,6 +127,8 @@ export const make = Effect.gen(function* () {
         title,
         workspace_root AS "workspaceRoot",
         default_model_selection_json AS "defaultModelSelection",
+        COALESCE((SELECT thread_type FROM t3_fork_project_thread_defaults
+          WHERE project_id = projection_projects.project_id), 't3') AS "defaultThreadType",
         default_thread_env_mode AS "defaultThreadEnvMode",
         auto_pull AS "autoPull",
         favicon_path AS "faviconPath",
@@ -195,6 +205,13 @@ export const make = Effect.gen(function* () {
             deleted_at = excluded.deleted_at
         `,
       ),
+      Effect.tap(
+        () => sql`
+        INSERT INTO t3_fork_project_thread_defaults (project_id, thread_type)
+        VALUES (${row.projectId}, ${row.defaultThreadType ?? "t3"})
+        ON CONFLICT(project_id) DO UPDATE SET thread_type = excluded.thread_type
+      `,
+      ),
     );
 
   const mapError =
@@ -233,6 +250,7 @@ export const make = Effect.gen(function* () {
           title: payload.title,
           workspaceRoot: payload.workspaceRoot,
           defaultModelSelection: payload.defaultModelSelection,
+          defaultThreadType: payload.defaultThreadType ?? "t3",
           defaultThreadEnvMode: payload.defaultThreadEnvMode ?? null,
           autoPull: false,
           faviconPath: payload.faviconPath ?? null,
@@ -258,6 +276,9 @@ export const make = Effect.gen(function* () {
       const payload = event.payload;
       yield* upsertRow({
         ...row,
+        ...(payload.defaultThreadType === undefined
+          ? {}
+          : { defaultThreadType: payload.defaultThreadType }),
         ...(payload.title === undefined ? {} : { title: payload.title }),
         ...(payload.workspaceRoot === undefined ? {} : { workspaceRoot: payload.workspaceRoot }),
         ...(payload.defaultModelSelection === undefined

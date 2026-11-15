@@ -6,6 +6,7 @@ import {
   type ProviderOptionSelection,
   type ScopedThreadRef,
   type ServerProviderModel,
+  type ServerProvider,
 } from "@t3tools/contracts";
 import {
   buildExplicitProviderOptionSelectionsFromDescriptors,
@@ -16,7 +17,7 @@ import {
 } from "@t3tools/shared/model";
 
 import type { DraftId } from "../../composerDraftStore";
-import { getProviderModelCapabilities } from "../../providerModels";
+import { getProviderModelCapabilities, getSharedCodexModelBlockReason } from "../../providerModels";
 import {
   getReasoningTraitStep,
   type PromptUltrathink,
@@ -30,6 +31,7 @@ type ComposerProviderStateInput = {
   promptInjectionState?: ComposerPromptInjectionState;
   modelOptions: ReadonlyArray<ProviderOptionSelection> | null | undefined;
   includePlanAgent?: boolean | undefined;
+  codexDesktopCatalog?: ServerProvider["codexDesktopCatalog"];
 };
 
 type ComposerPromptInjectionState = "none" | "ultrathink";
@@ -95,6 +97,22 @@ function resolveComposerOptionSelections(
 }
 
 export function getComposerProviderState(input: ComposerProviderStateInput): ComposerProviderState {
+  if (
+    getSharedCodexModelBlockReason(
+      {
+        driver: input.provider,
+        models: input.models,
+        codexDesktopCatalog: input.codexDesktopCatalog,
+      },
+      input.model,
+    )
+  ) {
+    return {
+      provider: input.provider,
+      promptEffort: null,
+      modelOptionsForDispatch: input.modelOptions ?? undefined,
+    };
+  }
   const {
     provider,
     model,

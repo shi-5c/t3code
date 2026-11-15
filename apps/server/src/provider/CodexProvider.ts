@@ -410,12 +410,8 @@ const withCodexDiscoveryDeadline = Effect.fnUntraced(function* <A, E, R>(
   );
 });
 
-/**
- * Every Codex client on the machine shares that file, and the backend tailors
- * the catalog to each client's originator: the plain CLI does not get Sol
- * Ultrafast. App-server refreshes the catalog online at startup, so wait until
- * a write newer than this process's spawn lands, then list again.
- */
+/** The shared file is only a refresh hint; another client can write it.
+ * The second model/list still belongs to this independent probe, not the Desktop owner. */
 const requestCodexChatGptModels = Effect.fn("requestCodexChatGptModels")(function* (input: {
   readonly client: CodexClient.CodexAppServerClient["Service"];
   readonly codexHome: string;
@@ -439,7 +435,7 @@ const requestCodexChatGptModels = Effect.fn("requestCodexChatGptModels")(functio
   );
   if (refreshed === undefined) {
     yield* Effect.logWarning(
-      "Codex did not refresh its model catalog in time; using the cached catalog.",
+      "Codex catalog refresh was not observed in time; retaining the independent probe result.",
     );
     return models;
   }

@@ -1,3 +1,4 @@
+import { ProjectThreadTypeSetting } from "./ProjectThreadTypeSetting";
 import {
   DEFAULT_SERVER_SETTINGS,
   type ModelSelection,
@@ -327,6 +328,7 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
       id={category === "source-control" ? "source-control-defaults" : "project-defaults"}
       title={category === "source-control" ? "Repositories" : "New threads"}
     >
+      {category === "project" || category === "general" ? <ProjectThreadTypeSetting /> : null}
       {category === "project" ? (
         <>
           {modelRow}

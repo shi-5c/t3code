@@ -48,6 +48,7 @@ export interface ProviderAdapterRegistryV2Shape {
       readonly driver: ProviderAdapter.ProviderAdapterV2["Service"]["driver"];
       readonly continuationKey: string;
       readonly enabled: boolean;
+      readonly available?: boolean;
       readonly capabilities: OrchestrationV2ProviderCapabilities;
     },
     ProviderAdapterRegistryV2Error
@@ -147,6 +148,21 @@ export const layerFromProviderInstanceRegistry: Layer.Layer<
           driver: instance.driverKind,
           continuationKey: instance.continuationIdentity.continuationKey,
           enabled: instance.enabled,
+          ...(instanceId === "codex-desktop"
+            ? {
+                available:
+                  instance.enabled &&
+                  (yield* instance.snapshot.getSnapshot.pipe(
+                    Effect.map(
+                      (snapshot) =>
+                        snapshot.enabled &&
+                        snapshot.installed &&
+                        snapshot.status === "ready" &&
+                        snapshot.availability !== "unavailable",
+                    ),
+                  )),
+              }
+            : {}),
           capabilities,
         };
       }),
@@ -158,6 +174,24 @@ function makeRegistry(
   adapters: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>,
 ): ProviderAdapterRegistryV2Shape {
   return {
+    getMetadata: Effect.fn("ProviderAdapterRegistry.getMetadata")(function* (instanceId) {
+      const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
+      if (!adapter) return yield* new ProviderAdapterRegistryLookupError({ instanceId });
+      const capabilities = yield* adapter
+        .getCapabilities()
+        .pipe(
+          Effect.mapError(
+            (cause) => new ProviderAdapterRegistryMetadataError({ instanceId, cause }),
+          ),
+        );
+      return {
+        driver: adapter.driver,
+        continuationKey: String(instanceId),
+        enabled: true,
+        available: true,
+        capabilities,
+      };
+    }),
     get: Effect.fn("ProviderAdapterRegistry.get")(function* (instanceId) {
       const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
       if (!adapter) {

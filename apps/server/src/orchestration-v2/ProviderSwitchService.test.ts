@@ -29,6 +29,93 @@ const capabilitiesWithoutModelSwitch = {
   },
 };
 
+it.effect.each(["/repo", "/another-project"])(
+  "keeps shared session turns and workspaces when changing selection with process cwd %s",
+  (cwd) =>
+    Effect.gen(function* () {
+      const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+      const original = projection();
+      const thread = {
+        ...original,
+        providerSessions: [
+          ...original.providerSessions.map((session) => ({ ...session, cwd })),
+          {
+            ...original.providerSessions[0]!,
+            id: ProviderSessionId.make("peer-session"),
+            cwd: "/peer",
+            updatedAt: DateTime.add(now, { seconds: -1 }),
+          },
+        ],
+      };
+      for (const target of [
+        { ...thread.thread.modelSelection, model: "another-model" },
+        { ...thread.thread.modelSelection, options: [{ id: "reasoningEffort", value: "high" }] },
+        { ...thread.thread.modelSelection, options: [{ id: "serviceTier", value: "priority" }] },
+      ]) {
+        const plan = yield* service.plan({ projection: thread, targetModelSelection: target });
+        assert.equal(plan.transition.type, "switch_model_in_session");
+        assert.deepEqual(plan.releaseProviderSessionIds, []);
+        assert.equal(thread.thread.worktreePath, "/repo");
+        assert.equal(thread.providerSessions[0]!.cwd, cwd);
+        assert.equal(thread.providerSessions[1]!.cwd, "/peer");
+      }
+    }).pipe(
+      Effect.provide(
+        layerTest({ [currentInstanceId]: { continuationKey: "codex:account:primary" } }, () =>
+          Effect.succeed({ type: "apply_on_next_turn" }),
+        ),
+      ),
+    ),
+);
+
+it.effect.each(["/repo", "/different-owner-workspace"])(
+  "protects a non-multiplexed Desktop owner with cwd %s",
+  (cwd) =>
+    Effect.gen(function* () {
+      const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+      const original = projection();
+      const thread = {
+        ...original,
+        thread: {
+          ...original.thread,
+          providerInstanceId: currentInstanceId,
+          threadType: "codex-shared" as const,
+          codexSharedOwner: "desktop" as const,
+        },
+        providerSessions: original.providerSessions.map((session) => ({
+          ...session,
+          cwd,
+          capabilities: {
+            ...session.capabilities,
+            sessions: {
+              ...session.capabilities.sessions,
+              supportsMultipleProviderThreadsPerSession: false,
+            },
+          },
+        })),
+      };
+      for (const target of [
+        { ...thread.thread.modelSelection, model: "another-model" },
+        { ...thread.thread.modelSelection, options: [{ id: "reasoningEffort", value: "high" }] },
+        { ...thread.thread.modelSelection, options: [{ id: "serviceTier", value: "priority" }] },
+      ]) {
+        const planned = service.plan({ projection: thread, targetModelSelection: target });
+        if (cwd === "/repo") {
+          const plan = yield* planned;
+          assert.equal(plan.transition.type, "switch_model_in_session");
+          assert.deepEqual(plan.releaseProviderSessionIds, []);
+        } else yield* planned.pipe(Effect.flip);
+        assert.equal(thread.thread.worktreePath, "/repo");
+      }
+    }).pipe(
+      Effect.provide(
+        layerTest({ [currentInstanceId]: { continuationKey: "codex:account:primary" } }, () =>
+          Effect.succeed({ type: "apply_on_next_turn" }),
+        ),
+      ),
+    ),
+);
+
 function projection(): OrchestrationV2ThreadProjection {
   return {
     thread: {

@@ -1,4 +1,5 @@
 export * from "./baseSchemas.ts";
+export * from "./codexDesktop.ts";
 export * from "./assistantCitations.ts";
 export * from "./composerContext.ts";
 export * from "./composerContextClipboard.ts";
@@ -9,6 +10,7 @@ export * from "./environment.ts";
 export * from "./environmentHttp.ts";
 export * from "./relayClient.ts";
 export * from "./desktopBootstrap.ts";
+export * from "./threadType.ts";
 export * from "./desktopBrowser.ts";
 export * from "./desktopAppActivation.ts";
 export * from "./remoteAccess.ts";

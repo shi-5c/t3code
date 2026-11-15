@@ -1,0 +1,24 @@
+name: Fork Codex Desktop checks
+on:
+  push:
+    branches: [fork/codex-sync, fork/codex-sync-native]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          run-install: false
+      - run: vp install --frozen-lockfile
+      - run: pnpm --filter @t3tools/web exec playwright install chromium --only-shell
+      - run: vp test run apps/server/src/codexDesktop packages/contracts/src/codexDesktop.test.ts
+      - run: vp run check:changed origin/main

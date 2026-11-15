@@ -82,6 +82,7 @@ export function useComposerProviderModel(
     models: selectedProviderModels,
     promptInjectionState,
     modelOptions: modelState.modelOptions?.[selectedInstanceId],
+    codexDesktopCatalog: selection.selectedProviderEntry?.snapshot.codexDesktopCatalog,
   });
   return {
     providerInstanceEntries,

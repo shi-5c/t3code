@@ -1,3 +1,4 @@
+import { threadTypeOf } from "@t3tools/contracts";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { threadPullRequestsOf } from "../threadPullRequests.ts";
 import type {
@@ -135,6 +136,8 @@ function threadRunStatusIsActive(status: ThreadRuntimeSummary["status"]): boolea
 }
 
 export interface EnvironmentThreadShell {
+  readonly threadType?: OrchestrationV2ThreadShell["threadType"];
+  readonly codexDesktopHistory?: OrchestrationV2ThreadShell["codexDesktopHistory"];
   readonly environmentId: EnvironmentId;
   readonly id: ThreadId;
   readonly projectId: ProjectId;
@@ -289,6 +292,10 @@ export function presentThreadShell(
     providerInstanceId: thread.providerInstanceId,
     modelSelection: thread.modelSelection,
     runtimeMode: thread.runtimeMode,
+    threadType: threadTypeOf(thread),
+    ...(thread.codexDesktopHistory === undefined
+      ? {}
+      : { codexDesktopHistory: thread.codexDesktopHistory }),
     interactionMode: thread.interactionMode,
     branch: thread.branch,
     worktreePath: thread.worktreePath,

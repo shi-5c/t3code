@@ -31,6 +31,24 @@ import {
 import * as RpcAuthorization from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
+  it("separates Desktop observation from sending and stopping", () => {
+    for (const method of [
+      WS_METHODS.codexDesktopList,
+      WS_METHODS.codexDesktopWatch,
+      WS_METHODS.codexDesktopPreview,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+    for (const method of [
+      WS_METHODS.codexDesktopSend,
+      WS_METHODS.codexDesktopStop,
+      WS_METHODS.codexDesktopBind,
+      WS_METHODS.codexDesktopAttachExisting,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+    expect(requiredScopeForRpcMethod(WS_METHODS.codexDesktopEnable)).toBe(AuthProvidersManageScope);
+  });
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));
   });

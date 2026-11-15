@@ -30,7 +30,8 @@ function ChildApproval({ entry }: { entry: ChildThreadApproval }) {
       {approval.appName ? <p className="mt-2 text-muted-foreground">{approval.appName}</p> : null}
       {approval.responseCapability !== "live" ? (
         <p className="mt-2 text-warning">
-          Provider process is gone. Interrupt or restart the child thread to respond.
+          {approval.responseUnavailableReason ||
+            "Provider process is gone. Interrupt or restart the child thread to respond."}
         </p>
       ) : null}
       {approval.reason ? <p className="mt-2 text-muted-foreground">{approval.reason}</p> : null}

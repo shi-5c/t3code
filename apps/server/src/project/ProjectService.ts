@@ -195,6 +195,7 @@ export const make = Effect.gen(function* () {
     repositoryIdentity: enrichment?.repositoryIdentity ?? null,
     faviconPath: row.faviconPath ?? enrichment?.faviconPath ?? null,
     defaultModelSelection: row.defaultModelSelection,
+    defaultThreadType: row.defaultThreadType ?? "t3",
     defaultThreadEnvMode: row.defaultThreadEnvMode,
     autoPull: row.autoPull,
     projectIcon: row.projectIcon,
@@ -386,6 +387,7 @@ export const make = Effect.gen(function* () {
       yield* commit({
         type: "project.create",
         commandId: input.commandId,
+        defaultThreadType: input.defaultThreadType ?? "t3",
         projectId: input.projectId,
         title: input.title,
         workspaceRoot,
@@ -413,6 +415,9 @@ export const make = Effect.gen(function* () {
       yield* commit({
         type: "project.meta.update",
         commandId: input.commandId,
+        ...(input.defaultThreadType === undefined
+          ? {}
+          : { defaultThreadType: input.defaultThreadType }),
         projectId: input.projectId,
         ...(input.title === undefined ? {} : { title: input.title }),
         ...(workspaceRoot === previousRoot ? {} : { workspaceRoot }),

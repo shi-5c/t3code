@@ -1,0 +1,78 @@
+name: Fork upstream candidate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      branch: ${{ steps.merge.outputs.branch }}
+      base: ${{ steps.merge.outputs.base }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: merge
+        name: Prepare an isolated integration branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo 'The fork already contains upstream/main.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          revision=$(git rev-parse --short=12 upstream/main)
+          branch="sync/upstream-$revision"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "Candidate $branch already exists; review it before preparing another." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          if ! git merge --no-edit upstream/main; then
+            echo 'Upstream conflicts with the fork. Use scripts/fork-upstream-sync.ps1 to resolve and validate locally.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "Prepared $branch. Review the checks and repeat desktop acceptance before merging. No pull request, release or automatic installation was created." >> "$GITHUB_STEP_SUMMARY"
+
+  check:
+    needs: prepare
+    if: needs.prepare.outputs.branch != ''
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          run-install: false
+      - run: vp install --frozen-lockfile
+      - run: pnpm --filter @t3tools/web exec playwright install chromium --only-shell
+      - name: Check candidate changes
+        env:
+          FORK_BASE: ${{ needs.prepare.outputs.base }}
+        run: vp run check:changed $env:FORK_BASE

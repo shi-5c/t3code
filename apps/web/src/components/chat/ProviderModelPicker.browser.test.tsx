@@ -1,4 +1,9 @@
-import { ProviderDriverKind, ProviderInstanceId, type ModelSelection } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ModelSelection,
+  CODEX_DESKTOP_CATALOG_UNAVAILABLE,
+} from "@t3tools/contracts";
 import { useState } from "react";
 import { expect, it, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
@@ -168,4 +173,66 @@ it("keeps a docked picker open after a pick and hands focus to that model's effo
   await expect.element(page.getByRole("radio", { name: "Medium" })).toHaveFocus();
   await userEvent.keyboard("{Escape}");
   await expect.element(search).not.toBeInTheDocument();
+});
+
+it("keeps a missing shared model selected when its unavailable row is clicked or confirmed", async () => {
+  const instanceId = ProviderInstanceId.make("codex-desktop");
+  const entries = deriveProviderInstanceEntries([
+    {
+      instanceId,
+      driver: ProviderDriverKind.make("codex"),
+      displayName: "Codex Desktop Share",
+      enabled: true,
+      installed: true,
+      version: null,
+      status: "ready",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-11-12T00:00:00Z",
+      models: [
+        { slug: "shared-model-b", name: "AvailableQuartz", isCustom: false, capabilities: {} },
+      ],
+      slashCommands: [],
+      skills: [],
+      codexDesktopCatalog: CODEX_DESKTOP_CATALOG_UNAVAILABLE,
+    },
+  ]);
+  const saved = { instanceId, model: "shared-model-a", options: [{ id: "effort", value: "high" }] };
+  const onChange = vi.fn();
+  const options = new Map([
+    [
+      instanceId,
+      [
+        { slug: saved.model, name: "MissingZebra", isCustom: false, isUnavailable: true },
+        { slug: "shared-model-b", name: "AvailableQuartz", isCustom: false },
+      ],
+    ],
+  ]);
+  await using screen = await render(
+    <ProviderModelPicker
+      environmentId={null}
+      activeInstanceId={instanceId}
+      model={saved.model}
+      lockedProvider={ProviderDriverKind.make("codex")}
+      instanceEntries={entries}
+      modelOptionsByInstance={options}
+      onInstanceModelChange={onChange}
+    />,
+  );
+  await screen.getByRole("button", { name: "MissingZebra (Unavailable)", exact: true }).click();
+  const row = page.getByRole("option", { name: /MissingZebra/ });
+  await expect.element(row).toHaveAttribute("aria-disabled", "true");
+  (row.element() as HTMLElement).click();
+  expect(onChange).not.toHaveBeenCalled();
+  const search = page.getByRole("combobox");
+  await search.fill("MissingZebra");
+  await expect
+    .element(page.getByRole("option", { name: /AvailableQuartz/ }))
+    .not.toBeInTheDocument();
+  await userEvent.keyboard("{ArrowDown}{Enter}");
+  expect(onChange).not.toHaveBeenCalled();
+  expect(saved).toEqual({
+    instanceId,
+    model: "shared-model-a",
+    options: [{ id: "effort", value: "high" }],
+  });
 });

@@ -275,6 +275,10 @@ import {
   withUsageLimitsCommands,
 } from "@t3tools/shared/usageLimits";
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
+import * as CodexDesktop from "./codexDesktop/CodexDesktop.ts";
+import * as SharedDesktopThreads from "./codexDesktop/SharedDesktopThreads.ts";
+import * as DesktopHistoryLibrary from "./codexDesktop/DesktopHistoryLibrary.ts";
+import * as NativeTitleFollow from "./codexDesktop/NativeTitleFollow.ts";
 import * as AgentSessionImporter from "./project/AgentSessionImporter.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import { requestUrl } from "./requestUrl.ts";
@@ -1483,6 +1487,10 @@ export const layerWsRpc = (
         yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
       const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
       const agentSessionScanner = yield* AgentSessionScanner.AgentSessionScanner;
+      const codexDesktop = yield* CodexDesktop.CodexDesktop;
+      const sharedDesktopThreads = yield* SharedDesktopThreads.SharedDesktopThreads;
+      const desktopHistoryLibrary = yield* DesktopHistoryLibrary.DesktopHistoryLibrary;
+      const nativeTitleFollow = yield* Effect.serviceOption(NativeTitleFollow.NativeTitleFollow);
       const agentSessionImporter = yield* AgentSessionImporter.AgentSessionImporter;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
       const nativeChildWork = yield* NativeChildWorkQuery.NativeChildWorkQuery;
@@ -2070,6 +2078,18 @@ export const layerWsRpc = (
               : {}),
           }).pipe(
             Effect.andThen(
+              command.type === "thread.create" && command.importedNativeThread !== undefined
+                ? Effect.fail(
+                    new OrchestrationV2DispatchCommandError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      message:
+                        "Native identities can only be imported through the host's verified import or Desktop connection flow.",
+                    }),
+                  )
+                : Effect.void,
+            ),
+            Effect.andThen(
               startup
                 .enqueueCommand(
                   (command.type === "prepared-run.retry"
@@ -2247,6 +2267,7 @@ export const layerWsRpc = (
                 .enqueueCommand(
                   ThreadMessageIntake.launchThread({
                     commandId: input.commandId,
+                    ...(input.threadType === undefined ? {} : { threadType: input.threadType }),
                     ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
                     ...(input.reuseExistingThread === undefined
                       ? {}
@@ -2339,6 +2360,11 @@ export const layerWsRpc = (
         [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
+              Effect.andThen(
+                Option.isSome(nativeTitleFollow)
+                  ? nativeTitleFollow.value.acquire(input.threadId)
+                  : Effect.void,
+              ),
               Effect.andThen(subscribeOrchestrationV2Thread(input)),
             ),
           ),
@@ -2892,6 +2918,9 @@ export const layerWsRpc = (
                   projectId: project.projectId,
                   title: project.title,
                   workspaceRoot: project.workspaceRoot,
+                  ...(project.defaultThreadType === undefined
+                    ? {}
+                    : { defaultThreadType: project.defaultThreadType }),
                   createWorkspaceRootIfMissing: true,
                 })
                 .pipe(
@@ -3058,6 +3087,18 @@ export const layerWsRpc = (
         [WS_METHODS.attachmentsCreateUploadUrl]: (input) => issueAttachmentUploadUrl(input),
         [WS_METHODS.attachmentsDelete]: (input) => deletePendingAttachment(input.attachmentId),
         [WS_METHODS.agentSessionsScan]: () => agentSessionScanner.scan,
+        [WS_METHODS.codexDesktopList]: (input) => codexDesktop.list(input),
+        [WS_METHODS.codexDesktopPreview]: (input) => codexDesktop.preview(input.conversationId),
+        [WS_METHODS.codexDesktopHistoryLibrary]: () => desktopHistoryLibrary.state,
+        [WS_METHODS.codexDesktopHistoryPage]: (input) => desktopHistoryLibrary.page(input),
+        [WS_METHODS.codexDesktopWatch]: (input) => codexDesktop.watch(input.conversationId),
+        [WS_METHODS.codexDesktopSend]: (input) => codexDesktop.send(input),
+        [WS_METHODS.codexDesktopStop]: (input) => codexDesktop.stop(input),
+        [WS_METHODS.codexDesktopEnable]: () => sharedDesktopThreads.enable,
+        [WS_METHODS.codexDesktopBind]: (input) =>
+          sharedDesktopThreads.bind(input.conversationId, input.dismissUnsentAttemptId),
+        [WS_METHODS.codexDesktopAttachExisting]: (input) =>
+          sharedDesktopThreads.attachExisting(input.threadId, input.conversationId),
         [WS_METHODS.agentSessionsImport]: (input) =>
           agentSessionImporter.importRecentAgentThreads(input),
         [WS_METHODS.assetsCreateUrl]:
@@ -3530,6 +3571,10 @@ export const WS_RPC_SERVER_OPTIONS = {
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const serverBrowser = yield* ServerBrowser.ServerBrowser;
+    const codexDesktop = yield* CodexDesktop.CodexDesktop;
+    const sharedDesktopThreads = yield* SharedDesktopThreads.SharedDesktopThreads;
+    const desktopHistoryLibrary = yield* DesktopHistoryLibrary.DesktopHistoryLibrary;
+    const nativeTitleFollow = yield* NativeTitleFollow.NativeTitleFollow;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const npmRelease = yield* NpmRelease.NpmRelease;
     const pullRequests = yield* PullRequestService.PullRequestService;
@@ -3611,6 +3656,14 @@ export const layer = Layer.unwrap(
               Layer.provide(DefectReporter.layer),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provide(AgentSessionScanner.layer),
+              Layer.provide(Layer.succeed(CodexDesktop.CodexDesktop, codexDesktop)),
+              Layer.provide(
+                Layer.succeed(DesktopHistoryLibrary.DesktopHistoryLibrary, desktopHistoryLibrary),
+              ),
+              Layer.provide(Layer.succeed(NativeTitleFollow.NativeTitleFollow, nativeTitleFollow)),
+              Layer.provide(
+                Layer.succeed(SharedDesktopThreads.SharedDesktopThreads, sharedDesktopThreads),
+              ),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(Layer.succeed(NpmRelease.NpmRelease, npmRelease)),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),
@@ -3678,4 +3731,4 @@ export const layer = Layer.unwrap(
       ),
     );
   }),
-).pipe(Layer.provide(NpmRelease.layer));
+).pipe(Layer.provide(NpmRelease.layer), Layer.provide(CodexDesktop.layer));

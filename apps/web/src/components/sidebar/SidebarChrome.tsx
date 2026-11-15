@@ -1,4 +1,10 @@
-import { ArrowLeftIcon, ArrowRightIcon, ChartNoAxesColumnIcon, SettingsIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  ChartNoAxesColumnIcon,
+  LaptopIcon,
+  SettingsIcon,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { memo } from "react";
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
@@ -39,6 +45,8 @@ import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
 import { SidebarUpdateArchitectureWarning, SidebarUpdatePill } from "./SidebarUpdatePill";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
 import { observeResize } from "~/lib/observeResize";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
+import { codexDesktopReturnHrefAtom } from "../../state/codexDesktop";
 
 export const SidebarChromeHeader = memo(function SidebarChromeHeader({
   isElectron,
@@ -225,6 +233,9 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   const isOnUtilityPage = useLocation({
     select: (location) => isSidebarUtilityPage(location.pathname),
   });
+  const location = useLocation();
+  const returnHref = useAtomValue(codexDesktopReturnHrefAtom);
+  const desktopMode = location.pathname === "/codex-desktop";
   const pullRequestsSupported = usePullRequestsSupported();
   const closeMobileSidebar = () => {
     if (isMobile) {
@@ -257,7 +268,7 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
 
   return (
     <SidebarMenu className="flex-row items-center">
-      {isOnUtilityPage ? (
+      {isOnUtilityPage && !desktopMode ? (
         <SidebarMenuItem className="min-w-0 flex-1">
           <SidebarMenuButton onClick={handleBackClick}>
             <ArrowLeftIcon />
@@ -282,6 +293,26 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
             icon={<ChartNoAxesColumnIcon />}
             label="Usage"
             onClick={handleUsageClick}
+          />
+          <SidebarUtilityItem
+            icon={<LaptopIcon />}
+            label={desktopMode ? "Back to threads" : "Connect a Codex Desktop conversation"}
+            onClick={() => {
+              closeMobileSidebar();
+              if (desktopMode) {
+                void navigate({ href: returnHref ?? "/" });
+              } else {
+                appAtomRegistry.set(codexDesktopReturnHrefAtom, location.href);
+                void navigate({
+                  to: "/codex-desktop",
+                  search: {
+                    conversationId: undefined,
+                    sourceId: undefined,
+                    historyEnvironmentId: undefined,
+                  },
+                });
+              }
+            }}
           />
         </>
       )}

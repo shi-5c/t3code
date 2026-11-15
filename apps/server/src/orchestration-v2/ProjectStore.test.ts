@@ -11,6 +11,62 @@ import * as ProjectStore from "./ProjectStore.ts";
 it.layer(ProjectStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
   "ProjectStoreV2",
   (it) => {
+    it.effect("rolls back a rejected thread default and reconstructs it from project events", () =>
+      Effect.gen(function* () {
+        const projects = yield* ProjectStore.ProjectStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        const projectId = ProjectId.make("project-type-transaction");
+        const at = "2026-03-24T00:00:00.000Z";
+        const created = {
+          sequence: 1,
+          eventId: EventId.make("type-created"),
+          aggregateKind: "project",
+          aggregateId: projectId,
+          occurredAt: at,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          type: "project.created",
+          payload: {
+            projectId,
+            title: "Types",
+            workspaceRoot: "/tmp/type-transaction",
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: at,
+            updatedAt: at,
+          },
+        } as const;
+        yield* sql`CREATE TRIGGER reject_thread_default BEFORE INSERT ON t3_fork_project_thread_defaults
+          BEGIN SELECT RAISE(ABORT, 'test rejected default'); END`;
+        const failure = yield* sql.withTransaction(projects.apply(created)).pipe(Effect.result);
+        assert.equal(failure._tag, "Failure");
+        assert.isTrue(Option.isNone(yield* projects.get(projectId)));
+        yield* sql`DROP TRIGGER reject_thread_default`;
+        yield* projects.apply(created);
+        assert.equal(
+          Option.getOrNull(yield* projects.getShell(projectId))?.defaultThreadType,
+          "t3",
+        );
+        const changed = {
+          ...created,
+          sequence: 2,
+          eventId: EventId.make("type-changed"),
+          type: "project.meta-updated",
+          payload: { projectId, defaultThreadType: "codex-shared", updatedAt: at },
+        } as const;
+        yield* projects.apply(changed);
+        yield* sql`DELETE FROM t3_fork_project_thread_defaults WHERE project_id = ${projectId}`;
+        yield* sql`DELETE FROM projection_projects WHERE project_id = ${projectId}`;
+        yield* projects.apply(created);
+        yield* projects.apply(changed);
+        assert.equal(
+          Option.getOrNull(yield* projects.getShell(projectId))?.defaultThreadType,
+          "codex-shared",
+        );
+      }),
+    );
     it.effect("stores a model selection without options as JSON without an options key", () =>
       Effect.gen(function* () {
         const projects = yield* ProjectStore.ProjectStoreV2;
@@ -33,6 +89,7 @@ it.layer(ProjectStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemor
             title: "Null options project",
             workspaceRoot: "/tmp/project-null-options",
             defaultModelSelection: modelSelection,
+            defaultThreadType: "codex-shared",
             scripts: [],
             createdAt: "2026-03-24T00:00:00.000Z",
             updatedAt: "2026-03-24T00:00:00.000Z",
@@ -48,6 +105,10 @@ it.layer(ProjectStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemor
         assert.deepStrictEqual(
           Option.getOrNull(yield* projects.get(projectId))?.defaultModelSelection,
           modelSelection,
+        );
+        assert.strictEqual(
+          Option.getOrNull(yield* projects.getShell(projectId))?.defaultThreadType,
+          "codex-shared",
         );
       }),
     );
@@ -81,7 +142,13 @@ it.layer(ProjectStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemor
           sequence: 2,
           eventId: EventId.make("event-organized-pinned"),
           type: "project.meta-updated",
-          payload: { projectId, pinnedAt: at, archivedAt: at, updatedAt: at },
+          payload: {
+            projectId,
+            pinnedAt: at,
+            archivedAt: at,
+            defaultThreadType: "codex-shared",
+            updatedAt: at,
+          },
         });
         yield* projects.apply({
           ...event,
@@ -94,6 +161,7 @@ it.layer(ProjectStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemor
         const project = Option.getOrNull(yield* projects.get(projectId));
         assert.strictEqual(project?.pinnedAt, at);
         assert.strictEqual(project?.archivedAt, at);
+        assert.strictEqual(project?.defaultThreadType, "codex-shared");
       }),
     );
   },

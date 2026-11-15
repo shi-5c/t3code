@@ -1,3 +1,4 @@
+import { CODEX_SHARED_INSTANCE_ID, codexSharedOwnerOf, threadTypeOf } from "@t3tools/contracts";
 import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
 import { workspaceAreaProps } from "../lib/workspaceFocus";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
@@ -197,6 +198,7 @@ import {
   NO_PROVIDER_MODEL_SELECTION,
   providerInstanceEntriesFor,
   resolveProjectDefaultProviderModelSelection,
+  sharedConversationProviders,
   shouldShowInstanceBadge,
 } from "../providerInstances";
 import {
@@ -262,6 +264,14 @@ import {
 } from "../state/entities";
 import { useEnvironmentShellHasSnapshot } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
+import { DraftThreadType } from "./chat/DraftThreadType";
+import { NativeSharedConversation } from "./chat/NativeSharedConversation";
+import {
+  DesktopHistoryConversation,
+  DesktopOwnerPermissions,
+  useDesktopHistoryConnection,
+} from "./codexDesktop/DesktopHistoryConversation";
+import { isLocalEnvironmentDisabled } from "../localEnvironment";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialogHost, openExpandedImagePreview } from "./chat/ExpandedImageDialog";
 import {
@@ -659,6 +669,16 @@ export default function ChatView(props: ChatViewProps) {
     );
   // Draft ids survive promotion and expire on navigation, keeping the pending resend scoped correctly.
   const [workLocallyResendDraftId, setWorkLocallyResendDraftId] = useState<DraftId | null>(null);
+  const desktopHistoryConnection = useDesktopHistoryConnection({
+    environmentId,
+    threadId,
+    ...(serverProjection?.thread.codexDesktopHistory
+      ? {
+          nativeId: serverProjection.thread.codexDesktopHistory.nativeId,
+          sourceId: serverProjection.thread.codexDesktopHistory.sourceId,
+        }
+      : {}),
+  });
   const [feedbackSubmissionsByThreadKey, setFeedbackSubmissionsByThreadKey] = useState<
     Record<string, ReadonlyArray<CodexFeedbackSubmission>>
   >({});
@@ -722,7 +742,9 @@ export default function ChatView(props: ChatViewProps) {
   const [scrollToEndClearance, setScrollToEndClearance] = useState(0);
   const fanoutSelectionsAtom = draftFanoutSelectionsAtom(routeThreadKey);
   const { sendInFlight: sendInFlightRef } = draftSendState(routeThreadKey);
-  const multipleModelSelections = useAtomValue(fanoutSelectionsAtom);
+  const storedMultipleModelSelections = useAtomValue(fanoutSelectionsAtom);
+  const multipleModelSelections =
+    draftThread?.threadType === "codex-shared" ? null : storedMultipleModelSelections;
   const setMultipleModelSelections = (
     selections: SetStateAction<ReadonlyArray<ModelSelection> | null>,
   ) => {
@@ -764,24 +786,40 @@ export default function ChatView(props: ChatViewProps) {
     }
   }
   const nowMinute = useNowMinute();
-  const draftDefaultModelSelection = draftThread
+  const configuredDraftDefaultModelSelection = draftThread
     ? resolveProjectSettings(
         settings,
         fallbackDraftProject?.id ?? null,
         fallbackDraftProject ?? undefined,
       ).settings.defaultModelSelection
     : null;
+  const draftProviders = draftThread
+    ? (providersByEnvironment.get(draftThread.environmentId) ?? []).filter(
+        (provider) =>
+          draftThread.threadType !== "codex-shared" ||
+          provider.instanceId === CODEX_SHARED_INSTANCE_ID,
+      )
+    : EMPTY_PROVIDERS;
+  const draftDefaultModelSelection =
+    draftThread?.threadType === "codex-shared" &&
+    configuredDraftDefaultModelSelection?.instanceId !== CODEX_SHARED_INSTANCE_ID
+      ? resolveProjectDefaultProviderModelSelection(draftProviders, settings, draftThread.projectId)
+      : configuredDraftDefaultModelSelection;
   const draftModelResolution = draftThread
     ? resolveNewThreadModelSelection({
         defaultSelection:
           draftDefaultModelSelection ??
           resolveProjectDefaultProviderModelSelection(
-            providersByEnvironment.get(draftThread.environmentId) ?? [],
+            draftProviders,
             settings,
             draftThread.projectId,
           ),
-        fallbackSelection: settings.fallbackModelSelection,
-        providers: providersByEnvironment.get(draftThread.environmentId) ?? [],
+        fallbackSelection:
+          draftThread.threadType === "codex-shared" &&
+          settings.fallbackModelSelection?.instanceId !== CODEX_SHARED_INSTANCE_ID
+            ? null
+            : settings.fallbackModelSelection,
+        providers: draftProviders,
         settings,
         projectId: draftThread.projectId,
         now: Date.parse(`${nowMinute}:00Z`),
@@ -1226,10 +1264,20 @@ export default function ChatView(props: ChatViewProps) {
     : (primaryEnvironment?.serverConfig ?? null);
   const providerEnvironmentId = (activeThread ? activeEnvironment : primaryEnvironment)
     ?.environmentId;
-  const providerStatuses =
+  const environmentProviderStatuses =
     (providerEnvironmentId === undefined
       ? undefined
       : providersByEnvironment.get(providerEnvironmentId)) ?? EMPTY_PROVIDERS;
+  const sharedProviderScope =
+    isServerThread && activeThread && threadTypeOf(activeThread) === "codex-shared"
+      ? activeThread.providerInstanceId
+      : draftThread?.threadType === "codex-shared"
+        ? CODEX_SHARED_INSTANCE_ID
+        : null;
+  const providerStatuses = sharedConversationProviders(
+    environmentProviderStatuses,
+    sharedProviderScope,
+  );
   const selectedProviderByThreadId = composerActiveProvider ?? null;
   const threadProvider =
     activeThread?.modelSelection.instanceId ??
@@ -3350,6 +3398,96 @@ export default function ChatView(props: ChatViewProps) {
             onDrop={workspaceFileDropHandlers.onDrop}
           >
             <ThreadFind onClose={focusComposerStable} />
+            {serverProjection &&
+            codexSharedOwnerOf(serverProjection.thread) === "desktop" &&
+            activeProviderThread?.nativeThreadRef?.nativeId ? (
+              <DesktopOwnerPermissions
+                environmentId={activeThread.environmentId}
+                nativeId={activeProviderThread.nativeThreadRef.nativeId}
+              />
+            ) : null}
+            {serverProjection?.thread.codexDesktopHistory ? (
+              <DesktopHistoryConversation
+                key={`${activeThread.environmentId}:${activeThread.id}:${serverProjection?.thread.codexDesktopHistory?.sourceId}:${serverProjection?.thread.codexDesktopHistory?.nativeId}`}
+                environmentId={activeThread.environmentId}
+                threadId={activeThread.id}
+                nativeId={serverProjection.thread.codexDesktopHistory.nativeId}
+                sourceId={serverProjection.thread.codexDesktopHistory.sourceId}
+                connection={desktopHistoryConnection}
+              />
+            ) : null}
+            {serverProjection?.thread.codexTitleSync &&
+            (codexSharedOwnerOf(serverProjection.thread) !== "native" ||
+              serverProjection.thread.codexTitleSync.nativeSaved) &&
+            (serverProjection.thread.codexTitleSync.status !== "confirmed" ||
+              (serverProjection.thread.codexTitleSync.nativeSaved?.state ??
+                serverProjection.thread.codexTitleSync.saved?.state) === "conflict") ? (
+              <div
+                className="shrink-0 border-b px-4 py-2 text-xs text-muted-foreground"
+                role="status"
+              >
+                {serverProjection.thread.codexTitleSync.status === "conflict" ||
+                (serverProjection.thread.codexTitleSync.nativeSaved?.state ??
+                  serverProjection.thread.codexTitleSync.saved?.state) === "conflict"
+                  ? "Titles differ. Your T3 title is kept."
+                  : serverProjection.thread.codexTitleSync.source === "saved"
+                    ? "Title read from saved Codex data. Desktop display confirmation is pending."
+                    : "Title saved in T3. Automatic title write-back to Desktop is not available yet."}
+                {serverProjection.thread.codexTitleSync.nativeSaved ||
+                serverProjection.thread.codexTitleSync.saved ? (
+                  <span>
+                    {" "}
+                    Saved Codex title:{" "}
+                    {serverProjection.thread.codexTitleSync.nativeSaved?.read.name ??
+                      serverProjection.thread.codexTitleSync.saved?.read.name}
+                    .
+                  </span>
+                ) : null}
+                {serverProjection.thread.codexTitleSync.ownerTitle ? (
+                  <span> Desktop: {serverProjection.thread.codexTitleSync.ownerTitle}.</span>
+                ) : null}
+                <span>
+                  {" "}
+                  To resolve, rename either side to match; Desktop-owned chats confirm on the next
+                  owner update.
+                </span>
+              </div>
+            ) : null}
+            {serverProjection && codexSharedOwnerOf(serverProjection.thread) === "native" ? (
+              <NativeSharedConversation
+                key={`${activeThread.environmentId}:${activeThread.id}:${serverProjection?.thread.codexDesktopHistory?.sourceId}:${serverProjection?.thread.codexDesktopHistory?.nativeId}`}
+                environmentId={activeThread.environmentId}
+                threadId={activeThread.id}
+                projectId={serverProjection.thread.projectId}
+                nativeId={activeProviderThread?.nativeThreadRef?.nativeId ?? null}
+                title={serverProjection.thread.title}
+                titleVersion={serverProjection.thread.codexTitleSync?.version ?? 0}
+                titleSource={serverProjection.thread.codexTitleSync?.source}
+                titlePreparation={activeProviderThread?.nativeMetadata?.codexNativeTitle}
+                creationUnknown={
+                  activeProviderThread?.nativeMetadata?.codexSharedCreationPending === true
+                }
+                busy={
+                  serverProjection.runs.some((run) =>
+                    ["preparing", "queued", "starting", "running", "waiting"].includes(run.status),
+                  ) ||
+                  serverProjection.runtimeRequests.some((request) => request.status === "pending")
+                }
+                canOpenLocally={
+                  isElectron &&
+                  primaryEnvironmentId === activeThread.environmentId &&
+                  !isLocalEnvironmentDisabled()
+                }
+                provider={settings.providerInstances[serverProjection.thread.providerInstanceId]}
+                desktopShare={serverProjection.thread.providerInstanceId === "codex-desktop"}
+                releaseState={
+                  activeProviderThread?.nativeMetadata?.codexSharedRelease?.nativeId ===
+                  activeProviderThread?.nativeThreadRef?.nativeId
+                    ? activeProviderThread?.nativeMetadata?.codexSharedRelease?.state
+                    : undefined
+                }
+              />
+            ) : null}
             {isWorkspaceFileDragActive ? <WorkspaceFileDropOverlay /> : null}
             <ChatBannerLane
               environmentId={activeThread.environmentId}
@@ -3517,6 +3655,14 @@ export default function ChatView(props: ChatViewProps) {
                           activeProjectRef={activeProjectRef}
                           activeProjectTitle={activeProject?.title ?? null}
                         />
+                        <DraftThreadType
+                          draftId={draftId}
+                          showEnable={
+                            !settings.providerInstances[
+                              ProviderInstanceId.make(CODEX_SHARED_INSTANCE_ID)
+                            ]
+                          }
+                        />
                       </div>
                     </div>
                   ) : null}
@@ -3567,6 +3713,7 @@ export default function ChatView(props: ChatViewProps) {
                                 reportedModelSelection={reportedModelSelection}
                                 multipleModelSelections={multipleModelSelections}
                                 supportsMultipleModels={
+                                  sharedProviderScope === null &&
                                   serverConfig?.environment.capabilities
                                     .requiredWorktreeBootstrap === true
                                 }
@@ -3604,19 +3751,35 @@ export default function ChatView(props: ChatViewProps) {
                                 canResume={resumableRunId !== null || hasHeldQueuedRuns}
                                 isRevertingCheckpoint={isRevertingCheckpoint}
                                 sendDisabledReason={
-                                  !canOperateThread
-                                    ? "This connection cannot change threads."
-                                    : isEnvironmentChanging
-                                      ? "Preparing machine"
-                                      : isRevertingCheckpoint
-                                        ? "Rewinding conversation"
-                                        : feedbackUploading
-                                          ? "Sending feedback"
-                                          : threadDetailLoading
-                                            ? "Messages loading"
-                                            : worktreeSetupBlocksSend
-                                              ? "Preparing worktree"
-                                              : projectCloneSendBlockReason
+                                  serverProjection?.thread.codexDesktopHistory &&
+                                  !desktopHistoryConnection.ready
+                                    ? "Open this conversation in Codex Desktop and connect it before sending. Saved history remains readable."
+                                    : serverProjection &&
+                                        codexSharedOwnerOf(serverProjection.thread) === "native" &&
+                                        serverProjection.thread.providerInstanceId !==
+                                          CODEX_SHARED_INSTANCE_ID
+                                      ? "This development shared conversation is read-only. Use Codex Desktop Share for supported shared conversations."
+                                      : serverProjection?.thread.threadType === "codex-shared" &&
+                                          (activeProviderThread?.nativeMetadata
+                                            ?.codexSharedCreationPending ||
+                                            ["pending", "unknown"].includes(
+                                              activeProviderThread?.nativeMetadata
+                                                ?.codexSharedRelease?.state ?? "",
+                                            ))
+                                        ? "Native creation or release is not confirmed. Wait before sending."
+                                        : !canOperateThread
+                                          ? "This connection cannot change threads."
+                                          : isEnvironmentChanging
+                                            ? "Preparing machine"
+                                            : isRevertingCheckpoint
+                                              ? "Rewinding conversation"
+                                              : feedbackUploading
+                                                ? "Sending feedback"
+                                                : threadDetailLoading
+                                                  ? "Messages loading"
+                                                  : worktreeSetupBlocksSend
+                                                    ? "Preparing worktree"
+                                                    : projectCloneSendBlockReason
                                 }
                                 isPreparingWorktree={isPreparingWorktree && !sendQueuesBehindSetup}
                                 bannerItems={

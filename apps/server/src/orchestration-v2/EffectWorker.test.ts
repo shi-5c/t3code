@@ -111,6 +111,7 @@ function layerExecutorFor(input: {
         close: () => Effect.void,
         closeInstance: () => Effect.void,
         release: () => record("release"),
+        releaseSharedThread: () => Effect.void,
         detach: () => record("detach"),
         otherWorkingThreads: () => Effect.succeed([]),
         releaseUnlessBusy: () => Effect.succeed(true),

@@ -34,6 +34,23 @@ import {
   ChatGptHandoffState,
 } from "./providerSetup.ts";
 import * as Schema from "effect/Schema";
+import {
+  CodexDesktopTarget,
+  CodexDesktopUpdate,
+  CodexDesktopList,
+  CodexDesktopListInput,
+  CodexDesktopPreview,
+  CodexDesktopHistoryLibraryState,
+  CodexDesktopHistoryPageInput,
+  CodexDesktopHistoryPage,
+  CodexDesktopSend,
+  CodexDesktopStop,
+  CodexDesktopReceipt,
+  CodexDesktopError,
+  CodexDesktopBinding,
+  CodexDesktopBindInput,
+  CodexDesktopAttachExistingInput,
+} from "./codexDesktop.ts";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
@@ -429,6 +446,16 @@ export const WS_METHODS = {
   filesystemBrowse: "filesystem.browse",
   filesystemGetMetadata: "filesystem.getMetadata",
   agentSessionsScan: "agentSessions.scan",
+  codexDesktopList: "codexDesktop.list",
+  codexDesktopPreview: "codexDesktop.preview",
+  codexDesktopHistoryLibrary: "codexDesktop.historyLibrary",
+  codexDesktopHistoryPage: "codexDesktop.historyPage",
+  codexDesktopWatch: "codexDesktop.watch",
+  codexDesktopSend: "codexDesktop.send",
+  codexDesktopStop: "codexDesktop.stop",
+  codexDesktopEnable: "codexDesktop.enable",
+  codexDesktopBind: "codexDesktop.bind",
+  codexDesktopAttachExisting: "codexDesktop.attachExisting",
   agentSessionsImport: "agentSessions.import",
   assetsCreateUrl: "assets.createUrl",
   assetsPersistChatAttachments: "assets.persistChatAttachments",
@@ -1416,6 +1443,54 @@ const WsAgentSessionsScanRpc = Rpc.make(WS_METHODS.agentSessionsScan, {
   error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
 });
 
+const WsCodexDesktopListRpc = Rpc.make(WS_METHODS.codexDesktopList, {
+  payload: Schema.UndefinedOr(CodexDesktopListInput),
+  success: CodexDesktopList,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopPreviewRpc = Rpc.make(WS_METHODS.codexDesktopPreview, {
+  payload: CodexDesktopTarget,
+  success: CodexDesktopPreview,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopHistoryLibraryRpc = Rpc.make(WS_METHODS.codexDesktopHistoryLibrary, {
+  success: CodexDesktopHistoryLibraryState,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopHistoryPageRpc = Rpc.make(WS_METHODS.codexDesktopHistoryPage, {
+  payload: CodexDesktopHistoryPageInput,
+  success: CodexDesktopHistoryPage,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopEnableRpc = Rpc.make(WS_METHODS.codexDesktopEnable, {
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopBindRpc = Rpc.make(WS_METHODS.codexDesktopBind, {
+  payload: CodexDesktopBindInput,
+  success: CodexDesktopBinding,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopAttachExistingRpc = Rpc.make(WS_METHODS.codexDesktopAttachExisting, {
+  payload: CodexDesktopAttachExistingInput,
+  success: CodexDesktopBinding,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopWatchRpc = Rpc.make(WS_METHODS.codexDesktopWatch, {
+  payload: CodexDesktopTarget,
+  success: CodexDesktopUpdate,
+  stream: true,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopSendRpc = Rpc.make(WS_METHODS.codexDesktopSend, {
+  payload: CodexDesktopSend,
+  success: CodexDesktopReceipt,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+const WsCodexDesktopStopRpc = Rpc.make(WS_METHODS.codexDesktopStop, {
+  payload: CodexDesktopStop,
+  error: Schema.Union([CodexDesktopError, EnvironmentAuthorizationError]),
+});
+
 const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
   payload: AgentSessionImportInput,
   success: AgentSessionImportResult,
@@ -2197,6 +2272,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsFilesystemBrowseRpc,
   WsFilesystemGetMetadataRpc,
   WsAgentSessionsScanRpc,
+  WsCodexDesktopListRpc,
+  WsCodexDesktopPreviewRpc,
+  WsCodexDesktopHistoryLibraryRpc,
+  WsCodexDesktopHistoryPageRpc,
+  WsCodexDesktopWatchRpc,
+  WsCodexDesktopSendRpc,
+  WsCodexDesktopStopRpc,
+  WsCodexDesktopEnableRpc,
+  WsCodexDesktopBindRpc,
+  WsCodexDesktopAttachExistingRpc,
   WsAgentSessionsImportRpc,
   WsAssetsCreateUrlRpc,
   WsAssetsPersistChatAttachmentsRpc,

@@ -114,6 +114,9 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
     /** False once a newer send from this composer started. */
     readonly isCurrentSend: () => boolean;
   }) => {
+    const threadType = draftId
+      ? (useComposerDraftStore.getState().getDraftSession(draftId)?.threadType ?? "t3")
+      : (project.defaultThreadType ?? "t3");
     const { attachments: attachmentsSnapshot, messageText } = sendSnapshot;
     const failedSelections: ModelSelection[] = [];
     let clearedDraft = false;
@@ -178,6 +181,7 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
                   interactionMode: DEFAULT_INTERACTION_MODE,
                   bootstrap: {
                     createThread: {
+                      threadType,
                       projectId: project.id,
                       title,
                       modelSelection: target.selection,
