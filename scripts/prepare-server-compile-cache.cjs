@@ -15,6 +15,11 @@ module.exports = async ({ appOutDir, electronPlatformName, arch, packager }) => 
     console.log("[server-compile-cache] Skipping untrusted bundle");
     return;
   }
+  // Native snapshots can omit this cold-start optimization to stay within the file limit.
+  if (process.env.T3CODE_SKIP_PREPARED_SERVER_CACHE === "1") {
+    console.log("[server-compile-cache] Skipping optional prepared cache by build configuration");
+    return;
+  }
   const targetArch = ["ia32", "x64", "armv7l", "arm64", "universal"][arch];
   const runsWithRosetta =
     electronPlatformName === "darwin" &&
