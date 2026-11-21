@@ -21,7 +21,10 @@ it.effect.each([
   [{ versions: ["1.0.0.0", "2.0.0.0"], hasCli: false, hasOverride: false }, "Multiple"],
   [{ versions: ["1.0.0.0"], hasCli: false, hasOverride: false }, "unrecognized CLI layout"],
   [{ versions: ["1.0.0.0"], hasCli: true, hasOverride: true }, "existing CODEX_CLI_PATH override"],
-  [{ versions: ["1.0.0.0"], hasCli: true, hasOverride: false }, "no verified shared connection"],
+  [
+    { versions: ["1.0.0.0"], hasCli: true, hasOverride: false },
+    "per-thread authorization and revocation",
+  ],
 ] as const)("keeps the runtime unavailable for probe %j", ([probe, expected]) =>
   Effect.gen(function* () {
     const error = yield* preflight;
