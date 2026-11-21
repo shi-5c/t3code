@@ -550,6 +550,7 @@ function AccessGatedProviderSettings({
       environmentId={environment.environmentId}
       environmentLabel={environment.label}
       readOnly={access.kind === "read-only"}
+      canManageDesktopShare={isDesktopLocalConnectionTarget(environment.entry.target)}
       deviceTabs={deviceTabs}
       targetInstanceId={targetInstanceId}
       projectIds={projectIds}
@@ -567,6 +568,7 @@ export function EnvironmentProviderSettings({
   deviceTabs,
   targetInstanceId,
   projectIds = NO_PROJECT_IDS,
+  canManageDesktopShare = true,
 }: {
   readonly environmentId: EnvironmentId;
   readonly environmentLabel: string;
@@ -574,6 +576,7 @@ export function EnvironmentProviderSettings({
   readonly targetInstanceId?: ProviderInstanceId | undefined;
   readonly projectIds?: readonly ProjectId[];
   readonly readOnly?: boolean;
+  readonly canManageDesktopShare?: boolean;
 }) {
   const searchableSetting = useSearchableSetting();
   const gt = useGT();
@@ -875,9 +878,13 @@ export function EnvironmentProviderSettings({
   const deleteInstance = useStableCallback(
     async (instanceId: ProviderInstanceId, instance: ProviderInstanceConfig) => {
       const confirmed = await confirmProviderInstanceRemoval(
-        gt("Remove the {provider} provider instance?", {
-          provider: providerInstanceName(instance),
-        }),
+        instance.driver === "codexDesktopShare" && resolveProviderInstanceEnabled(instance)
+          ? gt(
+              "Remove Codex Desktop Share and restore the original launch configuration? Codex Desktop may restart and interrupt active work.",
+            )
+          : gt("Remove the {provider} provider instance?", {
+              provider: providerInstanceName(instance),
+            }),
       );
       if (!confirmed) return;
       const updateResult = await persistProviderInstance({
@@ -996,6 +1003,7 @@ export function EnvironmentProviderSettings({
         selected={mode === "list" && selectedRow?.instanceId === row.instanceId}
         readOnly={readOnly}
         canWriteSettings={canWriteSettings}
+        canManageDesktopShare={canManageDesktopShare}
         liveProvider={serverProviders.find((candidate) => candidate.instanceId === row.instanceId)}
         isUpdateDispatching={updatingProviderInstanceIds.has(row.instanceId)}
         showProjectOverride={showProjectOverride}
@@ -1299,6 +1307,7 @@ function ProviderInstanceRow({
   selected,
   readOnly,
   canWriteSettings,
+  canManageDesktopShare,
   liveProvider,
   isUpdateDispatching,
   showProjectOverride,
@@ -1319,6 +1328,7 @@ function ProviderInstanceRow({
   readonly selected: boolean;
   readonly readOnly: boolean;
   readonly canWriteSettings: boolean;
+  readonly canManageDesktopShare: boolean;
   readonly liveProvider: ServerProvider | undefined;
   readonly isUpdateDispatching: boolean;
   readonly showProjectOverride: boolean;
@@ -1334,7 +1344,8 @@ function ProviderInstanceRow({
   const allProjects = useProjects();
   const secretSources = useSecretSources(environmentId);
   const acpProjects =
-    mode === "editor" && liveProvider?.driver === "acpRegistry"
+    mode === "editor" &&
+    (liveProvider?.driver === "acpRegistry" || liveProvider?.driver === "codexDesktopShare")
       ? allProjects.filter((project) => project.environmentId === environmentId)
       : undefined;
   const instance = explicitInstance ?? { driver };
@@ -1372,6 +1383,7 @@ function ProviderInstanceRow({
   return (
     <ProviderInstanceCard
       environmentId={environmentId}
+      canManageDesktopShare={canManageDesktopShare}
       secretSources={secretSources}
       acpProjects={acpProjects}
       projectOverride={projectOverride}

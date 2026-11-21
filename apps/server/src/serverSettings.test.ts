@@ -19,6 +19,7 @@ import {
   type SimlockDeviceHostConfig,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -31,6 +32,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SchemaAST from "effect/SchemaAST";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
@@ -590,6 +592,65 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings"
         });
       }).pipe(Effect.provide(layerServerSettings())),
   );
+
+  it.effect("restores the Desktop launch when the local Share connection fails", () => {
+    const actions: string[] = [];
+    const firstConnection = Deferred.makeUnsafe<void>();
+    let connectionAttempts = 0;
+    const shareSpawner = Layer.mock(ChildProcessSpawner.ChildProcessSpawner)({
+      string: (command) => {
+        if (command._tag !== "StandardCommand") return Effect.succeed("null");
+        const actionIndex = command.args.indexOf("-Action");
+        if (actionIndex < 0) {
+          connectionAttempts += 1;
+          return Deferred.succeed(firstConnection, undefined).pipe(Effect.as("null"));
+        }
+        const action = String(command.args[actionIndex + 1]);
+        actions.push(action);
+        return Effect.succeed(
+          JSON.stringify({
+            status:
+              action === "Status"
+                ? "Unconfigured"
+                : action === "Enable"
+                  ? "Forwarding"
+                  : "Restored",
+          }),
+        );
+      },
+    });
+    return Effect.gen(function* () {
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const instanceId = ProviderInstanceId.make("codexDesktopShare_test");
+      const driver = ProviderDriverKind.make("codexDesktopShare");
+      const instance = { driver, enabled: false };
+      yield* service.updateProviderInstance({ operation: "create", instanceId, instance });
+      const activation = yield* service
+        .updateProviderInstance({
+          operation: "upsert",
+          instanceId,
+          instance: { driver, enabled: true },
+        })
+        .pipe(
+          Effect.provideService(ServerSettingsModule.DesktopShareLifecycleAuthorized, true),
+          Effect.provideService(HostProcess.Platform, "win32"),
+          Effect.provideService(HostProcess.Architecture, "x64"),
+          Effect.provideService(HostProcess.Environment, {
+            SystemRoot: "Windows",
+            T3CODE_DESKTOP_SHARE_SCRIPT: "example.ps1",
+          }),
+          Effect.flip,
+          Effect.forkScoped,
+        );
+      yield* Deferred.await(firstConnection);
+      yield* TestClock.adjust("3 seconds");
+      const failure = yield* Fiber.join(activation);
+      assert.equal(failure.operation, "enable-codex-desktop-share");
+      assert.deepEqual(actions, ["Status", "Enable", "Restore"]);
+      assert.equal(connectionAttempts, 3);
+      assert.deepEqual((yield* service.getSettings).providerInstances[instanceId], instance);
+    }).pipe(Effect.provide(layerServerSettings().pipe(Layer.provide(shareSpawner))));
+  });
 
   it.effect("pauses provider-instance mutations while a settings snapshot is in use", () =>
     Effect.gen(function* () {

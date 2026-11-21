@@ -38,6 +38,17 @@ export type ProviderWorkspaceSnapshot = ServerProvider &
     readonly workspaceModelsPending?: boolean;
   };
 
+export interface ProviderNativeSessionDiscovery {
+  readonly listSessions: (input: {
+    readonly cwd: string;
+    readonly cursor?: string;
+  }) => Effect.Effect<AcpRegistryListSessionsResult, AcpRegistryOperationError>;
+  readonly verifySession: (input: {
+    readonly cwd: string;
+    readonly sessionId: string;
+  }) => Effect.Effect<{ readonly model: string | null }, AcpRegistryOperationError>;
+}
+
 export interface ProviderInstance {
   readonly instanceId: ProviderInstanceId;
   readonly driverKind: ProviderDriverKind;
@@ -64,6 +75,7 @@ export interface ProviderInstance {
   readonly orchestrationAdapter: ProviderAdapter.ProviderAdapterV2["Service"];
   readonly textGeneration: ProviderTextGeneration;
   readonly auth?: ProviderAuthController;
+  readonly nativeSessionDiscovery?: ProviderNativeSessionDiscovery;
   readonly acpSessionManagement?: {
     readonly listSessions: (input: {
       readonly cwd: string;

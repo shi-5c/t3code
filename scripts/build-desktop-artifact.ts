@@ -1064,11 +1064,16 @@ export function resolveWindowsServerAsarIgnoreGlobs(arch: typeof BuildArch.Type)
 
 export const WINDOWS_PACKAGED_PAYLOAD_FILE_LIMIT = 80;
 export const WINDOWS_SERVER_RESOURCE_SOURCE_DIR = "apps/desktop/prod-resources/windows-server";
+const WINDOWS_DESKTOP_SHARE_RESOURCE_DIR = "apps/desktop/prod-resources/codex-desktop-share";
 export const WINDOWS_SERVER_EXTRA_RESOURCES = [
   {
     from: WINDOWS_SERVER_RESOURCE_SOURCE_DIR,
     to: ".",
     filter: [WINDOWS_SERVER_ASAR_RESOURCE, `${WINDOWS_SERVER_ASAR_RESOURCE}.unpacked/**/*`],
+  },
+  {
+    from: WINDOWS_DESKTOP_SHARE_RESOURCE_DIR,
+    to: "codex-desktop-share",
   },
 ] as const;
 export const WSL_RUNTIME_ARCHIVE_NAME = "wsl-runtime.tar.gz";
@@ -3996,6 +4001,19 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
       asarPath: windowsServerAsarPath,
       verbose: options.verbose,
     });
+    const bridgeResource = path.join(stageAppDir, WINDOWS_DESKTOP_SHARE_RESOURCE_DIR);
+    yield* fs.makeDirectory(bridgeResource, { recursive: true });
+    for (const source of [
+      "CodexDesktopShare.ps1",
+      "Lifecycle.psm1",
+      "Forwarder.cs",
+      "ShareBridge.cs",
+    ]) {
+      yield* fs.copyFile(
+        path.join(repoRoot, "native", "codex-desktop-share", source),
+        path.join(bridgeResource, source),
+      );
+    }
   }
   yield* stageCursorSdkPlatformPackages(
     path.join(

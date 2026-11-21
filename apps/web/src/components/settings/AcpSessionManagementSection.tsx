@@ -218,7 +218,7 @@ function InstanceSessionManagement(
       setNextCursor(result.value.nextCursor);
       return;
     }
-    reportFailure(gt("Could not list ACP sessions"), result);
+    reportFailure(gt("Could not list native sessions"), result);
   };
 
   const importNativeSession = async (session: AcpRegistrySession) => {
@@ -253,12 +253,12 @@ function InstanceSessionManagement(
       toastManager.add({
         type: "success",
         title: result.value.imported
-          ? gt("ACP session imported")
-          : gt("ACP session already imported"),
+          ? gt("Native session imported")
+          : gt("Native session already imported"),
       });
       return;
     }
-    reportFailure(gt("Could not import ACP session"), result);
+    reportFailure(gt("Could not import native session"), result);
   };
 
   const deleteNativeSession = async (session: AcpRegistrySession) => {
@@ -445,7 +445,7 @@ function InstanceSessionManagement(
                   }}
                 >
                   <SelectTrigger
-                    aria-label={gt("Project for ACP sessions")}
+                    aria-label={gt("Project for native sessions")}
                     className="w-40"
                     size="sm"
                   >

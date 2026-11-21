@@ -230,6 +230,7 @@ const makeImporter = Effect.fn(function* (
     AgentSessionImporter.layer.pipe(
       Layer.provide(
         Layer.mergeAll(
+          NodeServices.layer,
           sinkLayer,
           settings,
           Layer.succeed(IdAllocator.IdAllocatorV2, yield* IdAllocator.IdAllocatorV2),

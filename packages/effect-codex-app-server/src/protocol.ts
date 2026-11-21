@@ -13,6 +13,8 @@ import * as Stream from "effect/Stream";
 
 import * as CodexRpc from "./_generated/meta.gen.ts";
 import * as CodexError from "./errors.ts";
+
+export const IgnoreServerRequest = Symbol("ignore Codex server request");
 import { JsonRpcId, JsonRpcResponseEnvelope } from "./_internal/shared.ts";
 const isJsonRpcId = Schema.is(JsonRpcId);
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
@@ -371,7 +373,8 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                         request.method,
                       ),
                     ),
-                  onSuccess: (result) => respond(request.id, result),
+                  onSuccess: (result) =>
+                    result === IgnoreServerRequest ? Effect.void : respond(request.id, result),
                 }),
                 Effect.ensuring(
                   Ref.update(activeRequestHandlers, (count) => Math.max(0, count - 1)),

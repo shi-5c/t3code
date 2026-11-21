@@ -1,4 +1,5 @@
 import {
+  CODEX_DESKTOP_SHARE_DRIVER,
   ProviderInstanceId,
   ProviderSetupError,
   type OrchestrationV2ProviderCapabilities,
@@ -74,80 +75,89 @@ export const layerFromProviderInstanceRegistry: Layer.Layer<
     return ProviderAdapterRegistryV2.of({
       get: Effect.fn("ProviderAdapterRegistryV2.get")(function (instanceId) {
         return instances.getInstance(instanceId).pipe(
-          Effect.flatMap((instance) => {
-            if (instance === undefined)
-              return new ProviderAdapterRegistryLookupError({ instanceId });
-            const adapter = instance.orchestrationAdapter;
-            const auth = instance.auth;
-            const refuseBroken = Effect.fnUntraced(function* (snapshot: ServerProvider) {
-              return snapshot.version
-                ? brokenRuntimeError({
-                    instanceId,
-                    name: snapshot.displayName ?? instance.displayName ?? adapter.driver,
-                    version: snapshot.version,
-                    advisory: ModelManifest.providerCompatibility(
-                      yield* manifest.current,
-                      adapter.driver,
-                      snapshot.version,
-                    ),
-                  })
-                : undefined;
-            });
-            return Effect.succeed({
-              ...adapter,
-              openSession: (input) => {
-                const open = Effect.gen(function* () {
-                  if (!adapter.checksVersionAtHandshake) {
-                    let refused = yield* refuseBroken(yield* instance.snapshot.getSnapshot);
-                    // The last probe may predate an update, so look again before refusing.
-                    if (refused) refused = yield* refuseBroken(yield* instance.snapshot.refresh);
-                    if (refused) return yield* refused;
-                  }
-                  if (!auth) return yield* adapter.openSession(input);
-                  const binding = auth.credentialBinding;
-                  const related = binding
-                    ? (yield* instances.listInstances).filter(
-                        (instance) =>
-                          instance.auth?.credentialBinding?.key === binding.key &&
-                          instance.auth.credentialBinding.owner === binding.owner,
+          Effect.flatMap(
+            Effect.fn("ProviderAdapterRegistryV2.admitAdapter")(function* (instance) {
+              if (instance === undefined)
+                return yield* new ProviderAdapterRegistryLookupError({ instanceId });
+              if (instance.driverKind === CODEX_DESKTOP_SHARE_DRIVER) {
+                const snapshot = yield* instance.snapshot.getSnapshot;
+                if (!instance.enabled || snapshot.availability === "unavailable") {
+                  return yield* new ProviderAdapterRegistryLookupError({ instanceId });
+                }
+              }
+              const adapter = instance.orchestrationAdapter;
+              const auth = instance.auth;
+              const refuseBroken = Effect.fnUntraced(function* (snapshot: ServerProvider) {
+                return snapshot.version
+                  ? brokenRuntimeError({
+                      instanceId,
+                      name: snapshot.displayName ?? instance.displayName ?? adapter.driver,
+                      version: snapshot.version,
+                      advisory: ModelManifest.providerCompatibility(
+                        yield* manifest.current,
+                        adapter.driver,
+                        snapshot.version,
+                      ),
+                    })
+                  : undefined;
+              });
+              return {
+                ...adapter,
+                openSession: (input) => {
+                  const open = Effect.gen(function* () {
+                    if (!adapter.checksVersionAtHandshake) {
+                      let refused = yield* refuseBroken(yield* instance.snapshot.getSnapshot);
+                      // The last probe may predate an update, so look again before refusing.
+                      if (refused) refused = yield* refuseBroken(yield* instance.snapshot.refresh);
+                      if (refused) return yield* refused;
+                    }
+                    if (!auth) return yield* adapter.openSession(input);
+                    const binding = auth.credentialBinding;
+                    const related = binding
+                      ? (yield* instances.listInstances).filter(
+                          (instance) =>
+                            instance.auth?.credentialBinding?.key === binding.key &&
+                            instance.auth.credentialBinding.owner === binding.owner,
+                        )
+                      : [instance];
+                    for (const instance of related) {
+                      if (
+                        instance.auth?.isChangingCredentials &&
+                        (yield* instance.auth.isChangingCredentials)
                       )
-                    : [instance];
-                  for (const instance of related) {
-                    if (
-                      instance.auth?.isChangingCredentials &&
-                      (yield* instance.auth.isChangingCredentials)
-                    )
-                      return yield* new ProviderSetupError({
-                        instanceId,
-                        operation: "session",
-                        detail: "This provider's sign-in is changing. Try again after it finishes.",
-                      });
-                  }
-                  let admitted: Effect.Effect<
-                    ProviderAdapter.ProviderAdapterV2SessionRuntime,
-                    ProviderAdapter.ProviderAdapterV2Error | ProviderSetupError,
-                    Scope.Scope
-                  > = adapter.openSession(input);
-                  // Shared credential changes must interrupt a peer's startup too.
-                  for (const peer of related) {
-                    if (peer.auth?.withAccess) admitted = peer.auth.withAccess(admitted);
-                  }
-                  return yield* admitted;
-                });
-                return open.pipe(
-                  Effect.mapError((cause) =>
-                    isProviderSetupError(cause)
-                      ? new ProviderAdapter.ProviderAdapterOpenSessionError({
-                          driver: adapter.driver,
-                          providerSessionId: input.providerSessionId,
-                          cause,
-                        })
-                      : cause,
-                  ),
-                );
-              },
-            } satisfies ProviderAdapter.ProviderAdapterV2["Service"]);
-          }),
+                        return yield* new ProviderSetupError({
+                          instanceId,
+                          operation: "session",
+                          detail:
+                            "This provider's sign-in is changing. Try again after it finishes.",
+                        });
+                    }
+                    let admitted: Effect.Effect<
+                      ProviderAdapter.ProviderAdapterV2SessionRuntime,
+                      ProviderAdapter.ProviderAdapterV2Error | ProviderSetupError,
+                      Scope.Scope
+                    > = adapter.openSession(input);
+                    // Shared credential changes must interrupt a peer's startup too.
+                    for (const peer of related) {
+                      if (peer.auth?.withAccess) admitted = peer.auth.withAccess(admitted);
+                    }
+                    return yield* admitted;
+                  });
+                  return open.pipe(
+                    Effect.mapError((cause) =>
+                      isProviderSetupError(cause)
+                        ? new ProviderAdapter.ProviderAdapterOpenSessionError({
+                            driver: adapter.driver,
+                            providerSessionId: input.providerSessionId,
+                            cause,
+                          })
+                        : cause,
+                    ),
+                  );
+                },
+              } satisfies ProviderAdapter.ProviderAdapterV2["Service"];
+            }),
+          ),
         );
       }),
       list: Effect.fn("ProviderAdapterRegistryV2.list")(function () {

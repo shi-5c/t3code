@@ -163,6 +163,46 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
     }),
   );
 
+  it.effect("only replies to approval requests admitted for this client", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const screened = yield* Deferred.make();
+      const client = yield* CodexClient.make(stdio, {
+        acceptServerRequest: (request) =>
+          request.id === 11
+            ? Deferred.succeed(screened, undefined).pipe(Effect.as(false))
+            : Effect.succeed(true),
+      });
+      const handled: string[] = [];
+      yield* client.handleServerRequest("item/commandExecution/requestApproval", (request) =>
+        Effect.sync(() => {
+          handled.push(request.turnId);
+          return { decision: "decline" } as const;
+        }),
+      );
+      const send = (id: number, turnId: string) =>
+        Queue.offer(
+          input,
+          new TextEncoder().encode(
+            `${JSON.stringify({
+              id,
+              method: "item/commandExecution/requestApproval",
+              params: { itemId: "command", threadId: "shared-thread", turnId, startedAtMs: 1 },
+            })}\n`,
+          ),
+        );
+      yield* send(11, "desktop-turn");
+      yield* Deferred.await(screened);
+      yield* send(12, "t3-turn");
+      assert.deepEqual(JSON.parse(yield* Queue.take(output)), {
+        id: 12,
+        result: { decision: "decline" },
+      });
+      assert.deepEqual(handled, ["t3-turn"]);
+      assert.equal(yield* Queue.size(output), 0);
+    }),
+  );
+
   it.effect("warns once about a notification that fails to decode and keeps dispatching", () =>
     Effect.gen(function* () {
       const secret = "codex-notification-secret-sentinel";

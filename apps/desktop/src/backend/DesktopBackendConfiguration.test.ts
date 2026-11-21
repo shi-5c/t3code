@@ -317,6 +317,10 @@ describe("DesktopBackendConfiguration", () => {
         path.join(resourcesPath, "server.asar/apps/server/dist/bin.mjs"),
       );
       assert.equal(config.env.ELECTRON_RUN_AS_NODE, "1");
+      assert.equal(
+        config.env.T3CODE_DESKTOP_SHARE_SCRIPT,
+        path.join(resourcesPath, "codex-desktop-share", "CodexDesktopShare.ps1"),
+      );
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 

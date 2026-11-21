@@ -45,6 +45,7 @@ import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as SqlClient from "effect/sql/SqlClient";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import { resolveSymlinkTarget } from "@t3tools/shared/symlink";
@@ -59,6 +60,10 @@ import {
 } from "@t3tools/shared/serverSettings";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
+import {
+  checkDesktopShareConnection,
+  runDesktopShareLifecycle,
+} from "./provider/Drivers/CodexDesktopShareRuntime.ts";
 import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
 import {
   readSecretFieldValues,
@@ -254,11 +259,35 @@ function ensureProviderInstanceMutationAllowed(
   return Effect.void;
 }
 
+export const DesktopShareLifecycleAuthorized = Context.Reference<boolean>(
+  "t3/ServerSettings/DesktopShareLifecycleAuthorized",
+  { defaultValue: () => false },
+);
+
+function enabledDesktopShare(settings: ServerSettings) {
+  return Object.entries(settings.providerInstances).find(
+    ([, instance]) =>
+      instance.driver === CODEX_DESKTOP_SHARE_DRIVER && resolveProviderInstanceEnabled(instance),
+  )?.[0];
+}
+
 function validateDesktopShareSettings(
   current: ServerSettings,
   next: ServerSettings,
   settingsPath: string,
+  localHost = false,
 ): Effect.Effect<void, ServerSettingsError> {
+  const active = enabledDesktopShare(current);
+  const nextActive = enabledDesktopShare(next);
+  if (active !== nextActive && !localHost) {
+    return Effect.fail(
+      new ServerSettingsError({
+        settingsPath,
+        operation: "enable-codex-desktop-share",
+        providerInstanceId: nextActive ?? active,
+      }),
+    );
+  }
   for (const [id, instance] of Object.entries(next.providerInstances)) {
     const previous = current.providerInstances[ProviderInstanceId.make(id)];
     const share = instance.driver === CODEX_DESKTOP_SHARE_DRIVER;
@@ -282,7 +311,8 @@ function validateDesktopShareSettings(
     }
     if (
       resolveProviderInstanceEnabled(instance) &&
-      !(previouslyShared && resolveProviderInstanceEnabled(previous))
+      !(previouslyShared && resolveProviderInstanceEnabled(previous)) &&
+      (!localHost || nextActive !== id || (active !== undefined && active !== id))
     ) {
       return Effect.fail(
         new ServerSettingsError({
@@ -718,6 +748,7 @@ function foldLegacyProjectSettings(
 }
 
 const make = Effect.gen(function* () {
+  const shareSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const { settingsPath } = yield* ServerConfig.ServerConfig;
   const fs = yield* FileSystem.FileSystem;
   const pathService = yield* Path.Path;
@@ -1285,13 +1316,68 @@ const make = Effect.gen(function* () {
             managedBy: managedPolicy?.organization,
           });
         }
-        yield* validateDesktopShareSettings(current, vettedProviders.settings, settingsPath);
+        const canManageShare = yield* DesktopShareLifecycleAuthorized;
+        yield* validateDesktopShareSettings(
+          current,
+          vettedProviders.settings,
+          settingsPath,
+          canManageShare,
+        );
         // After vetting, which can keep stored variables a policy hides from clients.
         const persisted = yield* persistSettingsSecrets(
           current,
           withoutRemovedSecretProviderReferences(current, vettedProviders.settings),
         );
         const next = yield* normalizeServerSettings(persisted.settings);
+        const oldShare = enabledDesktopShare(current);
+        const newShare = enabledDesktopShare(next);
+        const lifecycle = (action: "Enable" | "Restore" | "Status") =>
+          runDesktopShareLifecycle(action).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, shareSpawner),
+            Effect.provideService(Path.Path, pathService),
+            Effect.mapError(
+              (cause) =>
+                new ServerSettingsError({
+                  settingsPath,
+                  operation: "enable-codex-desktop-share",
+                  providerInstanceId: newShare ?? oldShare,
+                  cause,
+                }),
+            ),
+          );
+        const reconcileShare = Effect.gen(function* () {
+          if (oldShare === newShare) return;
+          if (!newShare) {
+            yield* lifecycle("Restore");
+            return;
+          }
+          if (
+            managedPolicy?.limits?.maxRuntimeMode &&
+            managedPolicy.limits.maxRuntimeMode !== "full-access"
+          ) {
+            return yield* new ServerSettingsError({
+              settingsPath,
+              operation: "enable-codex-desktop-share",
+              providerInstanceId: newShare,
+              cause:
+                "Codex Desktop's native runtime permissions cannot be constrained by this T3 managed policy.",
+            });
+          }
+          const status = yield* lifecycle("Status");
+          if (status.status === "RestartPending") yield* lifecycle("Restore");
+          yield* lifecycle("Enable");
+          const online = yield* checkDesktopShareConnection().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, shareSpawner),
+          );
+          if (!online) {
+            yield* lifecycle("Restore");
+            return yield* new ServerSettingsError({
+              settingsPath,
+              operation: "enable-codex-desktop-share",
+              providerInstanceId: newShare,
+            });
+          }
+        });
         const materializedNext = yield* Effect.uninterruptibleMask(() =>
           Effect.gen(function* () {
             yield* invalidateMaterialized;
@@ -1301,9 +1387,15 @@ const make = Effect.gen(function* () {
               yield* rollbackSecretChanges;
               return yield* Effect.failCause(materializedExit.cause);
             }
+            const shareExit = yield* Effect.exit(reconcileShare);
+            if (Exit.isFailure(shareExit)) {
+              yield* rollbackSecretChanges;
+              return yield* Effect.failCause(shareExit.cause);
+            }
             const writeExit = yield* Effect.exit(writeSettingsAtomically(next));
             if (Exit.isFailure(writeExit)) {
               yield* rollbackSecretChanges;
+              if (newShare && !oldShare) yield* lifecycle("Restore");
               return yield* Effect.failCause(writeExit.cause);
             }
             return materializedExit.value;

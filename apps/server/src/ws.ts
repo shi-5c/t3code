@@ -1619,8 +1619,10 @@ export const layerWsRpc = (
         input: AcpRegistryListSessionsInput,
       ) {
         const project = yield* acpRegistrySessions.project(input.projectId);
-        const { instance, manager } = yield* acpRegistrySessions.sessionManager(input.instanceId);
-        const listed = yield* manager.listSessions({
+        const { instance, listSessions } = yield* acpRegistrySessions.sessionDiscovery(
+          input.instanceId,
+        );
+        const listed = yield* listSessions({
           cwd: project.workspaceRoot,
           ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
         });
@@ -2325,6 +2327,7 @@ export const layerWsRpc = (
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
               Effect.andThen(threadViewers.view(input.threadId)),
+              Effect.andThen(agentSessionImporter.watchNativeHistory(input.threadId)),
               Effect.andThen(subscribeOrchestrationV2Thread(input)),
             ),
           ),
@@ -2724,9 +2727,16 @@ export const layerWsRpc = (
                 )
               : undefined;
             const nextPatch = { ...patch, ...(deviceHosts ? { deviceHosts } : {}) };
-            const settings = yield* providerInstanceMutation === undefined
-              ? serverSettings.updateSettings(nextPatch)
-              : serverSettings.updateProviderInstance(providerInstanceMutation, nextPatch);
+            const update =
+              providerInstanceMutation === undefined
+                ? serverSettings.updateSettings(nextPatch)
+                : serverSettings.updateProviderInstance(providerInstanceMutation, nextPatch);
+            const settings = yield* update.pipe(
+              Effect.provideService(
+                ServerSettings.DesktopShareLifecycleAuthorized,
+                currentSession.subject === "desktop-bootstrap" && config.mode === "desktop",
+              ),
+            );
             return ServerSettings.redactServerSettingsForClient(settings, settingsClient);
           }),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) => sourceControlDiscovery.discover,

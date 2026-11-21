@@ -3,6 +3,7 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
+  isCodexDesktopShareInstance,
   isRuntimeModeAbove,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
@@ -29,8 +30,12 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
+import * as RcMap from "effect/RcMap";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -40,6 +45,11 @@ import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterReg
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import {
+  projectDesktopShareHistory,
+  readDesktopShareHistory,
+} from "../provider/CodexDesktopShareHistory.ts";
+import { openDesktopShareReader } from "../provider/Drivers/CodexDesktopShareRuntime.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 import * as ProjectService from "./ProjectService.ts";
 
@@ -204,7 +214,147 @@ const make = Effect.gen(function* () {
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const settingsService = yield* ServerSettings.ServerSettingsService;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
+  const openSharedReader = openDesktopShareReader().pipe(
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    Effect.timeout("12 seconds"),
+  );
+  const sharedProviderThread = Effect.fn("AgentSessionImporter.sharedProviderThread")(function* (
+    threadId: ThreadId,
+  ) {
+    const { thread, providerThreads } = yield* orchestrator.getThreadRecords(threadId, [
+      "providerThreads",
+    ]);
+    if (!isCodexDesktopShareInstance(thread.modelSelection.instanceId)) return undefined;
+    const settings = yield* settingsService.getSettings;
+    if (!settings.providerInstances[thread.modelSelection.instanceId]?.enabled) return undefined;
+    return providerThreads.find(
+      (candidate) =>
+        candidate.providerInstanceId === thread.modelSelection.instanceId &&
+        candidate.appThreadId === threadId &&
+        candidate.nativeThreadRef !== null,
+    );
+  });
+
+  const syncSharedHistory = Effect.fn("AgentSessionImporter.syncSharedHistory")(function* (
+    threadId: ThreadId,
+    client: Parameters<typeof readDesktopShareHistory>[0],
+    providerThread: OrchestrationV2ProviderThread,
+  ) {
+    const nativeId = providerThread.nativeThreadRef?.nativeId;
+    if (!nativeId) return 0;
+    const native = yield* readDesktopShareHistory(client, nativeId).pipe(
+      Effect.timeout("45 seconds"),
+    );
+    return yield* threadCommands.withLock(
+      threadId,
+      Effect.gen(function* () {
+        const records = yield* orchestrator.getThreadRecords(threadId, [
+          "providerThreads",
+          "providerTurns",
+          "turnItems",
+          "messages",
+        ]);
+        const current = records.providerThreads.find(
+          (candidate) => candidate.id === providerThread.id,
+        );
+        if (!current || current.nativeThreadRef?.nativeId !== nativeId) return 0;
+        const events = projectDesktopShareHistory({
+          threadId,
+          providerThread: current,
+          nativeCreatedAt: native.thread.createdAt,
+          turns: native.turns,
+          ownedTurnIds: new Set(
+            records.providerTurns.flatMap((turn) =>
+              turn.providerThreadId === current.id &&
+              turn.nativeTurnRef?.nativeId != null &&
+              (turn.status === "completed" || turn.completedAt === null)
+                ? [turn.nativeTurnRef.nativeId]
+                : [],
+            ),
+          ),
+          existingItems: new Set(records.turnItems.map((item) => item.id)),
+          existingNativeItems: new Map(
+            records.turnItems.flatMap((item) =>
+              item.providerThreadId === current.id && item.nativeItemRef?.nativeId != null
+                ? [[item.nativeItemRef.nativeId, item] as const]
+                : [],
+            ),
+          ),
+          existingMessages: new Map(records.messages.map((message) => [message.id, message])),
+        });
+        const markImported =
+          records.thread.historyOrigin !== "v1_import" && records.providerTurns.length === 0;
+        if (events.length > 0 || markImported) {
+          yield* eventSink.write({
+            events: markImported
+              ? [
+                  ...events,
+                  {
+                    id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${threadId}:native-history`),
+                    type: "thread.metadata-updated",
+                    threadId,
+                    providerInstanceId: current.providerInstanceId,
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...records.thread, historyOrigin: "v1_import" },
+                  },
+                ]
+              : events,
+          });
+        }
+        return events.filter((event) => event.type === "message.updated").length;
+      }),
+    );
+  });
+
+  const watchSharedHistory = Effect.fn("AgentSessionImporter.watchSharedHistory")(function* (
+    threadId: ThreadId,
+  ) {
+    const providerThread = yield* sharedProviderThread(threadId);
+    const nativeId = providerThread?.nativeThreadRef?.nativeId;
+    if (!providerThread || !nativeId) return;
+    const client = yield* openSharedReader;
+    const pending = yield* Queue.sliding<void>(1);
+    const wake = (payload: { readonly threadId: string }) =>
+      payload.threadId === nativeId
+        ? Queue.offer(pending, undefined).pipe(Effect.asVoid)
+        : Effect.void;
+    yield* client.handleServerNotification("turn/completed", wake);
+    yield* client.handleServerNotification("thread/compacted", wake);
+    yield* client.handleServerNotification("thread/reverted", wake);
+    yield* client.raw
+      .request("thread/resume", { threadId: nativeId, excludeTurns: true })
+      .pipe(Effect.timeout("12 seconds"));
+    yield* Queue.offer(pending, undefined);
+    return yield* Effect.raceFirst(
+      client.awaitTermination,
+      Effect.forever(
+        Queue.take(pending).pipe(
+          Effect.andThen(syncSharedHistory(threadId, client, providerThread)),
+        ),
+      ),
+    );
+  });
+  const sharedWatchers = yield* RcMap.make({
+    lookup: (threadId: ThreadId) =>
+      watchSharedHistory(threadId).pipe(
+        Effect.scoped,
+        Effect.ignore,
+        Effect.repeat(Schedule.spaced("3 seconds")),
+        Effect.forkScoped,
+      ),
+  });
+  const watchNativeHistory = Effect.fn("AgentSessionImporter.watchNativeHistory")(
+    function* (threadId: ThreadId) {
+      const { thread } = yield* orchestrator.getThreadRecords(threadId, []);
+      if (isCodexDesktopShareInstance(thread.modelSelection.instanceId)) {
+        yield* RcMap.get(sharedWatchers, threadId);
+      }
+    },
+    (effect) => Effect.ignore(effect),
+  );
+
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
   ) {
@@ -508,6 +658,13 @@ const make = Effect.gen(function* () {
     readonly threadId: ThreadId;
     readonly workspaceRoot: string;
   }) {
+    const shared = yield* sharedProviderThread(input.threadId);
+    if (shared) {
+      return yield* openSharedReader.pipe(
+        Effect.flatMap((client) => syncSharedHistory(input.threadId, client, shared)),
+        Effect.scoped,
+      );
+    }
     const pendingThread = Effect.map(
       orchestrator.getThreadRecords(input.threadId, ["providerThreads", "runs"]),
       (records) =>
@@ -596,7 +753,7 @@ const make = Effect.gen(function* () {
     return yield* commit(messages);
   });
 
-  return { importRecentAgentThreads, importNativeHistory };
+  return { importRecentAgentThreads, importNativeHistory, watchNativeHistory };
 });
 
 type AgentSessionImporterShape = Effect.Success<typeof make>;

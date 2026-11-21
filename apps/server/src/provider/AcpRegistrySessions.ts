@@ -11,7 +11,10 @@ import {
 } from "@t3tools/contracts";
 import * as AcpRegistryRuntimeCoordinator from "@t3tools/provider-acp-registry/server/AcpRegistryRuntimeCoordinator";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
-import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+import type {
+  ProviderInstance,
+  ProviderNativeSessionDiscovery,
+} from "@t3tools/provider-core/server/driver";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
@@ -46,6 +49,13 @@ export class AcpRegistrySessions extends Context.Service<
       {
         readonly instance: ProviderInstance;
         readonly manager: NonNullable<ProviderInstance["acpSessionManagement"]>;
+      },
+      AcpRegistryOperationError
+    >;
+    readonly sessionDiscovery: (instanceId: ProviderInstanceId) => Effect.Effect<
+      {
+        readonly instance: ProviderInstance;
+        readonly listSessions: ProviderNativeSessionDiscovery["listSessions"];
       },
       AcpRegistryOperationError
     >;
@@ -125,7 +135,7 @@ const make = Effect.gen(function* () {
     );
   });
 
-  const sessionManager = Effect.fn("AcpRegistrySessions.sessionManager")(function* (
+  const getInstance = Effect.fn("AcpRegistrySessions.getInstance")(function* (
     instanceId: ProviderInstanceId,
   ) {
     const instance = yield* providerInstances.getInstance(instanceId);
@@ -135,6 +145,13 @@ const make = Effect.gen(function* () {
         message: `Provider instance ${instanceId} was not found.`,
       });
     }
+    return instance;
+  });
+
+  const sessionManager = Effect.fn("AcpRegistrySessions.sessionManager")(function* (
+    instanceId: ProviderInstanceId,
+  ) {
+    const instance = yield* getInstance(instanceId);
     if (instance.acpSessionManagement === undefined) {
       return yield* new AcpRegistryOperationError({
         reason: "session_list_unsupported",
@@ -144,11 +161,25 @@ const make = Effect.gen(function* () {
     return { instance, manager: instance.acpSessionManagement };
   });
 
+  const sessionDiscovery = Effect.fn("AcpRegistrySessions.sessionDiscovery")(function* (
+    instanceId: ProviderInstanceId,
+  ) {
+    const instance = yield* getInstance(instanceId);
+    const discovery = instance.nativeSessionDiscovery ?? instance.acpSessionManagement;
+    if (discovery === undefined) {
+      return yield* new AcpRegistryOperationError({
+        reason: "session_list_unsupported",
+        message: "This provider does not expose native sessions.",
+      });
+    }
+    return { instance, listSessions: discovery.listSessions };
+  });
+
   const importSession = Effect.fn("AcpRegistrySessions.importSession")(function* (
     input: AcpRegistryImportSessionInput,
   ) {
     const { workspaceRoot } = yield* project(input.projectId);
-    const { instance } = yield* sessionManager(input.instanceId);
+    const { instance } = yield* sessionDiscovery(input.instanceId);
     const providerSnapshot = yield* instance.snapshot.getSnapshot;
     if (
       providerSnapshot.nativeSessions?.canLoad !== true &&
@@ -156,9 +187,15 @@ const make = Effect.gen(function* () {
     ) {
       return yield* new AcpRegistryOperationError({
         reason: "session_resume_unsupported",
-        message: "The ACP agent cannot load or resume native sessions.",
+        message: "This provider cannot load or resume native sessions.",
       });
     }
+    const nativeSession = instance.nativeSessionDiscovery
+      ? yield* instance.nativeSessionDiscovery.verifySession({
+          cwd: workspaceRoot,
+          sessionId: input.sessionId,
+        })
+      : undefined;
     const threadId = importedThreadId({
       driver: instance.driverKind,
       instanceId: input.instanceId,
@@ -202,9 +239,10 @@ const make = Effect.gen(function* () {
       (candidate) => candidate.instanceId === input.instanceId,
     );
     const model =
-      provider?.models.find((candidate) => candidate.isDefault)?.slug ??
-      provider?.models[0]?.slug ??
-      "default";
+      nativeSession?.model ||
+      (provider?.models.find((candidate) => candidate.isDefault)?.slug ??
+        provider?.models[0]?.slug ??
+        "default");
     const commandId = CommandId.make(yield* random.uuidV4());
     const launched = yield* Effect.result(
       startup.enqueueCommand(
@@ -212,7 +250,11 @@ const make = Effect.gen(function* () {
           commandId,
           threadId,
           projectId: input.projectId,
-          title: input.title ?? "Imported ACP session",
+          title:
+            input.title ??
+            (instance.nativeSessionDiscovery
+              ? "Imported Codex Desktop session"
+              : "Imported ACP session"),
           modelSelection: { instanceId: input.instanceId, model },
           runtimeMode: "approval-required",
           interactionMode: "default",
@@ -265,7 +307,13 @@ const make = Effect.gen(function* () {
     return { threadId, imported: true } as const;
   }, coordinator.withSessionMutation);
 
-  return AcpRegistrySessions.of({ project, sessionManager, findOwner, importSession });
+  return AcpRegistrySessions.of({
+    project,
+    sessionManager,
+    sessionDiscovery,
+    findOwner,
+    importSession,
+  });
 });
 
 export const layer = Layer.effect(AcpRegistrySessions, make);

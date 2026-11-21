@@ -33,6 +33,21 @@ Running `codex login` does not change a managed ChatGPT connection. In
 and complete the wizard. Then select that instance from the thread's model
 picker. See [Use multiple accounts](#use-multiple-accounts).
 
+## Share conversations with Codex Desktop on Windows
+
+In T3 Code on the Windows host, open **Settings → Providers → Add provider** and
+choose **Codex Desktop Share**. Enable it after finishing any work in Codex Desktop.
+T3 Code configures the bridge and restarts a supported Store installation. Codex
+Desktop continues to control workspace permissions and approvals for shared turns.
+
+Choose **Codex Desktop Share** when starting a new T3 thread, or open **Native
+sessions** in the provider's settings to list and import a project conversation.
+A shared thread keeps its provider instance and its original Codex conversation.
+
+If Codex Desktop closes, you can still read cached messages in T3 Code. Reopen
+Codex Desktop to reconnect. Disable or remove the provider from the Windows host
+to restore the original Codex Desktop launch configuration.
+
 ## Allow more time for provider checks
 
 If an authenticated Codex installation reports “Timed out while checking Codex

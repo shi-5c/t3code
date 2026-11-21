@@ -22,6 +22,9 @@ import { makeChildStdio, makeStderrTail, makeTerminationError } from "./_interna
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
   readonly logOutgoing?: boolean;
+  readonly acceptServerRequest?: (
+    request: CodexProtocol.CodexAppServerIncomingRequest,
+  ) => Effect.Effect<boolean>;
   readonly logger?: (
     event: CodexProtocol.CodexAppServerProtocolLogEvent,
   ) => Effect.Effect<void, never>;
@@ -230,7 +233,18 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
     onNotification: dispatchNotification,
-    onRequest: dispatchRequest,
+    onRequest: (request) =>
+      options.acceptServerRequest
+        ? options
+            .acceptServerRequest(request)
+            .pipe(
+              Effect.flatMap((accepted) =>
+                accepted
+                  ? dispatchRequest(request)
+                  : Effect.succeed(CodexProtocol.IgnoreServerRequest),
+              ),
+            )
+        : dispatchRequest(request),
     onTermination: (error) => Deferred.fail(termination, error).pipe(Effect.asVoid),
   });
 

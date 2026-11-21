@@ -323,7 +323,7 @@ it.each([true, false])(
     await expect
       .element(
         screen.getByRole("combobox", {
-          name: canList ? "Project for ACP sessions" : "Project for ACP providers",
+          name: canList ? "Project for native sessions" : "Project for ACP providers",
         }),
       )
       .toHaveFocus();
@@ -342,7 +342,7 @@ it.each([true, false])(
     await expect
       .element(
         screen.getByRole("combobox", {
-          name: canList ? "Project for ACP sessions" : "Project for ACP providers",
+          name: canList ? "Project for native sessions" : "Project for ACP providers",
         }),
       )
       .toHaveTextContent("Second");
@@ -382,7 +382,7 @@ it.each([true, false])(
     await expect
       .element(
         screen.getByRole("combobox", {
-          name: canList ? "Project for ACP sessions" : "Project for ACP providers",
+          name: canList ? "Project for native sessions" : "Project for ACP providers",
         }),
       )
       .toHaveTextContent("Antigravity");

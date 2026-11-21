@@ -2,6 +2,7 @@ import { pipe } from "effect/Function";
 import * as DocumentText from "../../provider/DocumentText.ts";
 import { brokenRuntimeError } from "../../provider/providerCompatibility.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
+import { readDesktopShareThread } from "../../provider/CodexDesktopShareHistory.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
@@ -591,9 +592,9 @@ const projectCodexDynamicToolItem = Effect.fn("CodexAdapterV2.projectDynamicTool
   return output === undefined ? projection : { ...projection, output };
 });
 
-function codexNativeItemRef(nativeItemId: string) {
+function codexNativeItemRef(nativeItemId: string, driver = CODEX_PROVIDER) {
   return {
-    driver: CODEX_PROVIDER,
+    driver,
     nativeId: nativeItemId,
     strength: "strong" as const,
   };
@@ -894,20 +895,22 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
 );
 
 function providerSession(input: {
+  readonly driver: ProviderDriverKind;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
   readonly providerInstanceId: ProviderInstanceId;
   readonly cwd: string | null;
   readonly model: string;
   readonly now: DateTime.Utc;
+  readonly capabilities: OrchestrationV2ProviderCapabilities;
 }): OrchestrationV2ProviderSession {
   return {
     id: input.providerSessionId,
-    driver: CODEX_PROVIDER,
+    driver: input.driver,
     providerInstanceId: input.providerInstanceId,
     status: "ready",
     cwd: input.cwd ?? process.cwd(),
     model: input.model,
-    capabilities: CodexProviderCapabilitiesV2,
+    capabilities: input.capabilities,
     createdAt: input.now,
     updatedAt: input.now,
     lastError: null,
@@ -927,6 +930,7 @@ const getNativeThreadId = Effect.fn("CodexAdapterV2.getNativeThreadId")(function
 });
 
 function providerThreadFromCodexThread(input: {
+  readonly driver: ProviderDriverKind;
   readonly appThreadId: ThreadId | null;
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly ownerNodeId: OrchestrationV2ProviderThread["ownerNodeId"];
@@ -942,16 +946,16 @@ function providerThreadFromCodexThread(input: {
 }): OrchestrationV2ProviderThread {
   return {
     id: input.idAllocator.derive.providerThread({
-      driver: CODEX_PROVIDER,
+      driver: input.driver,
       nativeThreadId: input.thread.id,
     }),
-    driver: CODEX_PROVIDER,
+    driver: input.driver,
     providerInstanceId: input.providerInstanceId,
     providerSessionId: input.providerSessionId,
     appThreadId: input.appThreadId,
     ownerNodeId: input.ownerNodeId,
     nativeThreadRef: {
-      driver: CODEX_PROVIDER,
+      driver: input.driver,
       nativeId: input.thread.id,
       strength: "strong" as const,
     },
@@ -1480,6 +1484,7 @@ export interface CodexAppServerClientFactoryShape {
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly settings: CodexSettings;
     readonly environment: NodeJS.ProcessEnv;
+    readonly acceptServerRequest?: CodexClient.CodexAppServerClientOptions["acceptServerRequest"];
   }) => Effect.Effect<
     CodexClient.CodexAppServerClient["Service"],
     ProviderAdapter.ProviderAdapterOpenSessionError,
@@ -1911,6 +1916,7 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
 });
 
 export interface CodexAdapterV2Options {
+  readonly sharedDesktop?: ProviderDriverKind;
   readonly instanceId: ProviderInstanceId;
   readonly settings: CodexSettings;
   readonly environment: NodeJS.ProcessEnv;
@@ -1939,18 +1945,49 @@ export interface CodexAdapterV2Options {
 export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
   adapterOptions: CodexAdapterV2Options,
 ) {
+  const providerDriver = adapterOptions.sharedDesktop ?? CODEX_PROVIDER;
+  const sharedDesktop = adapterOptions.sharedDesktop !== undefined;
+  const adapterItemRef = (id: string) => codexNativeItemRef(id, providerDriver);
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const readMcpSession = (threadId: ThreadId | null) =>
     threadId === null ? Effect.undefined : mcpSessions.read(threadId);
   const { clientFactory, digest, fileSystem, idAllocator, serverConfig } = adapterOptions;
   const continuationRequests = adapterOptions.continuationRequests;
 
+  const capabilities = sharedDesktop
+    ? {
+        ...CodexProviderCapabilitiesV2,
+        sessions: {
+          ...CodexProviderCapabilitiesV2.sessions,
+          supportsProviderSwitchingViaHandoff: false,
+          supportsRuntimeModeSwitchInSession: false,
+        },
+        threads: {
+          ...CodexProviderCapabilitiesV2.threads,
+          canRollbackThread: false,
+          canForkThread: false,
+          canForkFromTurn: false,
+          canForkWhileSourceRunning: false,
+          canForkFromSubagentThread: false,
+        },
+        turns: {
+          ...CodexProviderCapabilitiesV2.turns,
+          supportsNativeResume: false,
+          supportsSteeringByInterruptRestart: false,
+        },
+        checkpointing: {
+          ...CodexProviderCapabilitiesV2.checkpointing,
+          providerCanRollbackConversation: false,
+          providerRollbackReturnsSnapshot: false,
+        },
+      }
+    : CodexProviderCapabilitiesV2;
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
-    driver: CODEX_PROVIDER,
+    driver: providerDriver,
     checksVersionAtHandshake: adapterOptions.compatibility !== undefined,
     getCapabilities: Effect.fn("CodexAdapterV2.getCapabilities")(function () {
-      return Effect.succeed(CodexProviderCapabilitiesV2);
+      return Effect.succeed(capabilities);
     }),
     planSelectionTransition: Effect.fn("CodexAdapterV2.planSelectionTransition")(function () {
       return Effect.succeed(turnScopedSelectionTransition());
@@ -1965,12 +2002,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.mapError(
                   (cause) =>
                     new ProviderAdapter.ProviderAdapterOpenSessionError({
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       providerSessionId: input.providerSessionId,
                       cause,
                     }),
                 ),
               );
+        let acceptServerRequest: NonNullable<
+          CodexClient.CodexAppServerClientOptions["acceptServerRequest"]
+        > = () => Effect.succeed(false);
         const client = yield* clientFactory.open({
           instanceId: adapterOptions.instanceId,
           threadId: input.threadId,
@@ -1978,6 +2018,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           runtimePolicy: input.runtimePolicy,
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
           environment: resolvedRuntime?.environment ?? adapterOptions.environment,
+          ...(sharedDesktop
+            ? { acceptServerRequest: (request) => acceptServerRequest(request) }
+            : {}),
         });
         const codexZone = codexTimeZone(resolvedRuntime?.environment ?? adapterOptions.environment);
         const additionalContextByThread = yield* Ref.make(
@@ -2060,7 +2103,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   duration: CODEX_INITIALIZE_TIMEOUT,
                   orElse: () => {
                     const error = new ProviderAdapter.ProviderAdapterEventStreamError({
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       providerSessionId: input.providerSessionId,
                       cause: `Codex app-server did not answer initialize within ${CODEX_INITIALIZE_TIMEOUT}.`,
                     });
@@ -2109,11 +2152,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           );
         const now = yield* DateTime.now;
         const session = providerSession({
+          driver: providerDriver,
           providerSessionId: input.providerSessionId,
           providerInstanceId: adapterOptions.instanceId,
           cwd: input.runtimePolicy.cwd,
           model: input.modelSelection.model,
           now,
+          capabilities,
         });
         // Drain final notifications before the session manager retires the dead process.
         // Queue.fail lets readers take items already buffered before they see the failure.
@@ -2122,7 +2167,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             Queue.fail(
               events,
               new ProviderAdapter.ProviderAdapterEventStreamError({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 providerSessionId: input.providerSessionId,
                 cause,
               }),
@@ -2228,6 +2273,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           nativeThreadId: string,
           context: ActiveCodexTurnContext,
         ): Set<ProviderRequestKind> => {
+          if (sharedDesktop) return new Set();
           const runtimeMode = context.input.runtimePolicy.runtimeMode;
           const allowed = sessionApprovals.get(nativeThreadId);
           if (allowed?.runtimeMode === runtimeMode) return allowed.kinds;
@@ -2349,7 +2395,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (suggestion.length === 0 || suggestion.startsWith("Delegated task")) return;
             yield* emitProviderEvent({
               type: "prompt_suggestion.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: context.projectionThreadId,
               runId: context.input.runId,
               text: suggestion,
@@ -2368,7 +2414,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             state.pending = pending;
             yield* emitProviderEvent({
               type: "background_work.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               providerTurnId: context.providerTurnId,
               pending,
             });
@@ -2411,7 +2457,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           rootProviderThreads.set(nativeThreadId, updated);
           yield* emitProviderEvent({
             type: "provider_thread.updated",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             providerThread: updated,
           });
         });
@@ -2437,10 +2483,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const { ordinal, startedAt } = yield* resolveItemPosition(context, nativeItemId);
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: {
                   id: idAllocator.derive.turnItemFromProviderItem({
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     nativeItemId,
                   }),
                   threadId: context.projectionThreadId,
@@ -2448,7 +2494,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   nodeId: context.providerNodeId,
                   providerThreadId: context.providerThread.id,
                   providerTurnId: context.providerTurnId,
-                  nativeItemRef: { ...codexNativeItemRef(nativeItemId), strength: "weak" },
+                  nativeItemRef: { ...adapterItemRef(nativeItemId), strength: "weak" },
                   parentItemId: null,
                   ordinal,
                   type: "system_notice",
@@ -2490,7 +2536,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }
           yield* emitProviderEvent({
             type: "turn_item.updated",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             turnItem: codexRetryTurnItem(context, providerRetry, "completed", updatedAt),
           }).pipe(Effect.withSpan("CodexAdapterV2.completeProviderRetry"));
         });
@@ -2506,7 +2552,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             return existing;
           }
           const providerTurnId = idAllocator.derive.providerTurn({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeTurnId: input.nativeTurnId,
           });
           const context: ActiveCodexTurnContext = {
@@ -2566,7 +2612,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }
           yield* emitProviderEvent({
             type: "provider_turn.updated",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             threadId: input.turnInput.threadId,
             providerTurn: {
               id: providerTurnId,
@@ -2574,7 +2620,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nodeId: input.turnInput.rootNodeId,
               runAttemptId: input.turnInput.attemptId,
               nativeTurnRef: {
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 nativeId: input.nativeTurnId,
                 strength: "strong",
               },
@@ -2616,6 +2662,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           awaitRegisteredTurn(
             Ref.get(activeTurns).pipe(Effect.map((turns) => turns.get(nativeTurnId))),
           );
+
+        if (sharedDesktop) {
+          acceptServerRequest = Effect.fn("CodexDesktopShare.acceptServerRequest")(
+            function* (request) {
+              const payload = request.params;
+              if (payload === null || typeof payload !== "object") return false;
+              const turnId = Reflect.get(payload, "turnId");
+              const threadId =
+                Reflect.get(payload, "threadId") ?? Reflect.get(payload, "conversationId");
+              if (typeof turnId !== "string" || typeof threadId !== "string") return false;
+              if ((yield* Ref.get(activeTurns)).has(turnId)) return true;
+              if (!(yield* Ref.get(pendingRootTurns)).has(threadId)) return false;
+              return (yield* awaitActiveTurn(turnId)) !== undefined;
+            },
+          );
+        }
 
         const resolveItemEventContext =
           /* Provider events include streaming deltas; avoid a span for each update. */
@@ -2787,11 +2849,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }
           for (const tracked of items.values()) {
             const nodeId = idAllocator.derive.nodeFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: tracked.id,
             });
             const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: tracked.id,
             });
             const { ordinal, startedAt } = yield* resolveItemPosition(context, tracked.id);
@@ -2806,7 +2868,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               countsForRun: false,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(tracked.id),
+              nativeItemRef: adapterItemRef(tracked.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
               startedAt,
@@ -2819,7 +2881,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nodeId,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(tracked.id),
+              nativeItemRef: adapterItemRef(tracked.id),
               parentItemId: null,
               ordinal,
               status,
@@ -2835,12 +2897,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             };
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem,
             });
           }
@@ -2914,7 +2976,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const artifacts = yield* buildDynamicToolArtifacts(context, tracked);
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: {
                 ...artifacts.node,
                 status,
@@ -2923,7 +2985,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: {
                 ...artifacts.turnItem,
                 status,
@@ -3032,12 +3094,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
             yield* emitProviderEvent({
               type: "subagent.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               subagent: task,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: {
                 id: input.subagent.turnItemId,
                 threadId: task.threadId,
@@ -3132,7 +3194,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ancestor = ancestor.subagent?.parentContext;
             }
             const providerTurnId = idAllocator.derive.providerTurn({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeTurnId: turn.nativeTurnId,
             });
             const providerTurnOrdinal = yield* nextProviderTurnOrdinal(
@@ -3143,7 +3205,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               providerTurnOrdinal === 1
                 ? subagent.childRootNodeId
                 : idAllocator.derive.nodeFromProviderItem({
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     nativeItemId: `${turn.nativeTurnId}:thread-root`,
                   });
             const activeContext: ActiveCodexTurnContext = {
@@ -3183,7 +3245,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const now = yield* DateTime.now;
             yield* emitProviderEvent({
               type: "provider_thread.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               providerThread: {
                 ...subagent.providerThread,
                 status: "active",
@@ -3192,7 +3254,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "provider_turn.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: subagent.childThreadId,
               providerTurn: {
                 id: providerTurnId,
@@ -3200,7 +3262,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 nodeId: providerNodeId,
                 runAttemptId: null,
                 nativeTurnRef: {
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   nativeId: turn.nativeTurnId,
                   strength: "strong",
                 },
@@ -3212,7 +3274,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: {
                 id: providerNodeId,
                 threadId: subagent.childThreadId,
@@ -3302,7 +3364,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           };
           yield* emitProviderEvent({
             type: "subagent.updated",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             subagent: subagent.task,
           });
         });
@@ -3335,30 +3397,30 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
             const now = yield* DateTime.now;
             const subagentNodeId = idAllocator.derive.nodeFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: input.nativeItemId,
             });
             const childRootNodeId = idAllocator.derive.nodeFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: `${input.nativeItemId}:thread-root`,
             });
             const childThreadId = idAllocator.derive.subagentThread({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeThreadId: input.nativeThreadId,
             });
             const turnItemOrdinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
             const providerThread = {
               id: idAllocator.derive.providerThread({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 nativeThreadId: input.nativeThreadId,
               }),
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               providerInstanceId: input.context.input.modelSelection.instanceId,
               providerSessionId: input.context.providerThread.providerSessionId,
               appThreadId: childThreadId,
               ownerNodeId: null,
               nativeThreadRef: {
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 nativeId: input.nativeThreadId,
                 strength: "strong" as const,
               },
@@ -3382,11 +3444,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               parentNodeId: input.context.itemParentNodeId,
               origin: "provider_native",
               createdBy: "agent",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               providerInstanceId: input.context.input.modelSelection.instanceId,
               providerThreadId: providerThread.id,
               childThreadId,
-              nativeTaskRef: codexNativeItemRef(input.nativeItemId),
+              nativeTaskRef: adapterItemRef(input.nativeItemId),
               prompt: input.prompt,
               title: input.title,
               model: reportedSelection?.model ?? input.model,
@@ -3436,7 +3498,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nativeTurnIds: new Set<string>(),
               startedAt: now,
               turnItemId: idAllocator.derive.turnItemFromProviderItem({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 nativeItemId: input.nativeItemId,
               }),
               turnItemOrdinal,
@@ -3450,12 +3512,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "app_thread.created",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               appThread: childThread,
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: {
                 id: subagentNodeId,
                 threadId: input.context.projectionThreadId,
@@ -3467,7 +3529,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 countsForRun: false,
                 providerThreadId: providerThread.id,
                 providerTurnId: input.context.providerTurnId,
-                nativeItemRef: codexNativeItemRef(input.nativeToolCallId),
+                nativeItemRef: adapterItemRef(input.nativeToolCallId),
                 runtimeRequestId: null,
                 checkpointScopeId: null,
                 startedAt: now,
@@ -3476,7 +3538,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: {
                 id: childRootNodeId,
                 threadId: childThreadId,
@@ -3488,7 +3550,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 countsForRun: false,
                 providerThreadId: providerThread.id,
                 providerTurnId: null,
-                nativeItemRef: codexNativeItemRef(input.nativeItemId),
+                nativeItemRef: adapterItemRef(input.nativeItemId),
                 runtimeRequestId: null,
                 checkpointScopeId: null,
                 startedAt: now,
@@ -3497,7 +3559,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "provider_thread.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               providerThread,
             });
             if (input.emitInitialPrompt && input.prompt.length > 0) {
@@ -3505,18 +3567,18 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const promptArtifacts = makeSubagentConversationArtifacts({
                 senderThreadId: input.context.projectionThreadId,
                 messageId: idAllocator.derive.messageFromProviderItem({
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   nativeItemId: promptNativeItemId,
                 }),
                 turnItemId: idAllocator.derive.turnItemFromProviderItem({
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   nativeItemId: promptNativeItemId,
                 }),
                 threadId: childThreadId,
                 rootNodeId: childRootNodeId,
                 providerThreadId: providerThread.id,
                 providerTurnId: null,
-                nativeItemRef: codexNativeItemRef(promptNativeItemId),
+                nativeItemRef: adapterItemRef(promptNativeItemId),
                 role: "user",
                 text: input.prompt,
                 ordinal: 100,
@@ -3524,12 +3586,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
               yield* emitProviderEvent({
                 type: "message.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 message: promptArtifacts.message,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: promptArtifacts.turnItem,
               });
             }
@@ -3701,7 +3763,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const planId = yield* idAllocator.allocate.plan({
               threadId: context.projectionThreadId,
               ...(context.projectionRunId === null ? {} : { runId: context.projectionRunId }),
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
             });
             yield* Ref.update(planIds, (current) => {
               const updated = new Map(current);
@@ -3724,7 +3786,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterProtocolError({
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     detail: `Failed to read attachment '${attachment.id}'.`,
                     reason: "attachment_unreadable",
                     payload: cause,
@@ -3783,16 +3845,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           const updatedAt = yield* DateTime.now;
           const completedAt = completed ? updatedAt : null;
           const nodeId = idAllocator.derive.nodeFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: item.id,
           });
           const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
           const messageId = idAllocator.derive.messageFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: item.id,
           });
           const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: item.id,
           });
           const node: OrchestrationV2ExecutionNode = {
@@ -3806,7 +3868,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             countsForRun: false,
             providerThreadId: context.providerThread.id,
             providerTurnId: context.providerTurnId,
-            nativeItemRef: codexNativeItemRef(item.id),
+            nativeItemRef: adapterItemRef(item.id),
             runtimeRequestId: null,
             checkpointScopeId: null,
             startedAt,
@@ -3833,7 +3895,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nodeId,
             providerThreadId: context.providerThread.id,
             providerTurnId: context.providerTurnId,
-            nativeItemRef: codexNativeItemRef(item.id),
+            nativeItemRef: adapterItemRef(item.id),
             parentItemId: null,
             ordinal,
             status: completed ? "completed" : "running",
@@ -3875,10 +3937,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 update.turnId,
               );
               const { messageId: _messageId, ...item } = artifacts.turnItem;
-              const nativeItemRef = codexNativeItemRef(part.nativeItemId);
+              const nativeItemRef = adapterItemRef(part.nativeItemId);
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: {
                   ...artifacts.node,
                   kind: "reasoning",
@@ -3888,7 +3950,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: {
                   ...item,
                   type: "reasoning",
@@ -3981,19 +4043,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               );
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               if (update.completed) {
                 yield* emitProviderEvent({
                   type: "message.updated",
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   message: artifacts.message,
                 });
               }
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
               if (finalAnswerItem && update.completed) {
@@ -4035,18 +4097,18 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const artifacts = makeSubagentConversationArtifacts({
               senderThreadId: context.subagent.parentContext.projectionThreadId,
               messageId: idAllocator.derive.messageFromProviderItem({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 nativeItemId: item.id,
               }),
               turnItemId: idAllocator.derive.turnItemFromProviderItem({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 nativeItemId: item.id,
               }),
               threadId: context.projectionThreadId,
               rootNodeId: context.rootNodeId,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(item.id),
+              nativeItemRef: adapterItemRef(item.id),
               role: "user",
               text,
               ordinal,
@@ -4054,12 +4116,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "message.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               message: artifacts.message,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             return true;
@@ -4079,11 +4141,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           const status = codexItemStatus(item.status);
           const completedAt = status.completed ? updatedAt : null;
           const nodeId = idAllocator.derive.nodeFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: item.id,
           });
           const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: item.id,
           });
           const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
@@ -4098,7 +4160,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             countsForRun: false,
             providerThreadId: context.providerThread.id,
             providerTurnId: context.providerTurnId,
-            nativeItemRef: codexNativeItemRef(item.id),
+            nativeItemRef: adapterItemRef(item.id),
             runtimeRequestId: null,
             checkpointScopeId: null,
             startedAt,
@@ -4111,7 +4173,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nodeId,
             providerThreadId: context.providerThread.id,
             providerTurnId: context.providerTurnId,
-            nativeItemRef: codexNativeItemRef(item.id),
+            nativeItemRef: adapterItemRef(item.id),
             parentItemId: null,
             ordinal,
             status: status.turnItem,
@@ -4152,11 +4214,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const status = codexItemStatus(item.status);
             const completedAt = status.completed ? updatedAt : null;
             const nodeId = idAllocator.derive.nodeFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: item.id,
             });
             const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: item.id,
             });
             const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
@@ -4171,7 +4233,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               countsForRun: false,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(item.id),
+              nativeItemRef: adapterItemRef(item.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
               startedAt,
@@ -4184,7 +4246,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nodeId,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(item.id),
+              nativeItemRef: adapterItemRef(item.id),
               parentItemId: null,
               ordinal,
               status: status.turnItem,
@@ -4216,11 +4278,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const updatedAt = input.updatedAt ?? (yield* DateTime.now);
             const completedAt = input.status === "running" ? null : updatedAt;
             const nodeId = idAllocator.derive.nodeFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: input.item.id,
             });
             const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: input.item.id,
             });
             const { ordinal, startedAt } = yield* resolveItemPosition(input.context, input.item.id);
@@ -4237,7 +4299,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               countsForRun: false,
               providerThreadId: input.context.providerThread.id,
               providerTurnId: input.context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(input.item.id),
+              nativeItemRef: adapterItemRef(input.item.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
               startedAt,
@@ -4250,7 +4312,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nodeId,
               providerThreadId: input.context.providerThread.id,
               providerTurnId: input.context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(input.item.id),
+              nativeItemRef: adapterItemRef(input.item.id),
               parentItemId: null,
               ordinal,
               status,
@@ -4271,11 +4333,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const status = codexItemStatus(item.status);
             const completedAt = status.completed ? updatedAt : null;
             const nodeId = idAllocator.derive.nodeFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: item.id,
             });
             const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: item.id,
             });
             const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
@@ -4293,7 +4355,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               countsForRun: false,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(item.id),
+              nativeItemRef: adapterItemRef(item.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
               startedAt,
@@ -4306,7 +4368,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nodeId,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(item.id),
+              nativeItemRef: adapterItemRef(item.id),
               parentItemId: null,
               ordinal,
               title: projection.title ?? null,
@@ -4346,12 +4408,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: { ...artifacts.node, ...(cancelled ? { status: "cancelled" } : {}) },
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: {
                 ...artifacts.turnItem,
                 title: "Generate image",
@@ -4472,12 +4534,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     };
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem,
               });
               if ((yield* Ref.get(settledTurns)).has(nativeTurnId)) {
@@ -4496,12 +4558,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const artifacts = yield* buildDynamicToolArtifacts(context, item);
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
             }
@@ -4520,11 +4582,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           const completedAt = input.completed === true ? updatedAt : null;
           const planId = yield* resolvePlanId(input.context, input.nativeItemId);
           const nodeId = idAllocator.derive.nodeFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: input.nativeItemId,
           });
           const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: input.nativeItemId,
           });
           const { ordinal, startedAt } = yield* resolveItemPosition(
@@ -4551,7 +4613,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             countsForRun: false,
             providerThreadId: input.context.providerThread.id,
             providerTurnId: input.context.providerTurnId,
-            nativeItemRef: codexNativeItemRef(input.nativeItemId),
+            nativeItemRef: adapterItemRef(input.nativeItemId),
             runtimeRequestId: null,
             checkpointScopeId: null,
             startedAt,
@@ -4564,7 +4626,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nodeId,
             providerThreadId: input.context.providerThread.id,
             providerTurnId: input.context.providerTurnId,
-            nativeItemRef: codexNativeItemRef(input.nativeItemId),
+            nativeItemRef: adapterItemRef(input.nativeItemId),
             parentItemId: null,
             ordinal,
             status: input.completed === true ? "completed" : "running",
@@ -4600,17 +4662,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "plan.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 plan: artifacts.plan,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
             }, Effect.orDie),
@@ -4629,11 +4691,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const completedAt = input.completed === true ? updatedAt : null;
             const planId = yield* resolvePlanId(input.context, input.nativeItemId);
             const nodeId = idAllocator.derive.nodeFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: input.nativeItemId,
             });
             const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: input.nativeItemId,
             });
             const { ordinal, startedAt } = yield* resolveItemPosition(
@@ -4661,7 +4723,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               countsForRun: false,
               providerThreadId: input.context.providerThread.id,
               providerTurnId: input.context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(input.nativeItemId),
+              nativeItemRef: adapterItemRef(input.nativeItemId),
               runtimeRequestId: null,
               checkpointScopeId: null,
               startedAt,
@@ -4674,7 +4736,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nodeId,
               providerThreadId: input.context.providerThread.id,
               providerTurnId: input.context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(input.nativeItemId),
+              nativeItemRef: adapterItemRef(input.nativeItemId),
               parentItemId: null,
               ordinal,
               status: input.completed === true ? "completed" : "running",
@@ -4707,7 +4769,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           const parentNodeId =
             subagent?.subagentNodeId ??
             idAllocator.derive.nodeFromProviderItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeItemId: input.nativeItemId,
             });
           const ordinal = yield* resolveItemOrdinal(
@@ -4715,7 +4777,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             `${input.nativeItemId}:approval:${input.nativeRequestId}`,
           );
           const requestId = yield* idAllocator.allocate.runtimeRequest({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             providerTurnId: owner.providerTurnId,
             nativeRequestId: input.nativeRequestId,
           });
@@ -4737,7 +4799,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             countsForRun: false,
             providerThreadId: owner.providerThread.id,
             providerTurnId: owner.providerTurnId,
-            nativeItemRef: codexNativeItemRef(input.nativeItemId),
+            nativeItemRef: adapterItemRef(input.nativeItemId),
             runtimeRequestId: requestId,
             checkpointScopeId: null,
             startedAt: createdAt,
@@ -4748,7 +4810,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nodeId,
             providerTurnId: owner.providerTurnId,
             nativeRequestRef: {
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeId: input.nativeRequestId,
               strength: "strong",
             },
@@ -4768,7 +4830,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nodeId,
             providerThreadId: owner.providerThread.id,
             providerTurnId: owner.providerTurnId,
-            nativeItemRef: codexNativeItemRef(input.nativeItemId),
+            nativeItemRef: adapterItemRef(input.nativeItemId),
             parentItemId: null,
             ordinal,
             status: "waiting",
@@ -4799,7 +4861,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         }) {
           const createdAt = yield* DateTime.now;
           const requestId = yield* idAllocator.allocate.runtimeRequest({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             providerTurnId: input.context.providerTurnId,
             nativeRequestId: input.nativeRequestId,
           });
@@ -4826,11 +4888,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               })) ?? [],
           }));
           const nodeId = idAllocator.derive.nodeFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: input.nativeItemId,
           });
           const turnItemId = idAllocator.derive.turnItemFromProviderItem({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             nativeItemId: input.nativeItemId,
           });
           const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
@@ -4845,7 +4907,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             countsForRun: false,
             providerThreadId: input.context.providerThread.id,
             providerTurnId: input.context.providerTurnId,
-            nativeItemRef: codexNativeItemRef(input.nativeItemId),
+            nativeItemRef: adapterItemRef(input.nativeItemId),
             runtimeRequestId: requestId,
             checkpointScopeId: null,
             startedAt: createdAt,
@@ -4856,7 +4918,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nodeId,
             providerTurnId: input.context.providerTurnId,
             nativeRequestRef: {
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeId: input.nativeRequestId,
               strength: "strong",
             },
@@ -4876,7 +4938,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nodeId,
             providerThreadId: input.context.providerThread.id,
             providerTurnId: input.context.providerTurnId,
-            nativeItemRef: codexNativeItemRef(input.nativeItemId),
+            nativeItemRef: adapterItemRef(input.nativeItemId),
             parentItemId: null,
             ordinal,
             status: "waiting",
@@ -4891,6 +4953,57 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           };
           return { node, request, turnItem, nativeQuestionIds };
         });
+
+        const awaitRuntimeResponse = <A>(
+          response: Deferred.Deferred<A>,
+          artifacts: {
+            readonly node: OrchestrationV2ExecutionNode;
+            readonly request: OrchestrationV2RuntimeRequest;
+            readonly turnItem: OrchestrationV2TurnItem;
+          },
+        ) =>
+          Deferred.await(response).pipe(
+            Effect.onInterrupt(() =>
+              sharedDesktop
+                ? Effect.gen(function* () {
+                    if (yield* Deferred.isDone(response)) return;
+                    const now = yield* DateTime.now;
+                    yield* emitProviderEvent({
+                      type: "runtime_request.updated",
+                      driver: providerDriver,
+                      threadId: artifacts.node.threadId,
+                      runtimeRequest: {
+                        ...artifacts.request,
+                        status: "cancelled",
+                        resolvedAt: now,
+                      },
+                    });
+                    yield* emitProviderEvent({
+                      type: "node.updated",
+                      driver: providerDriver,
+                      node: { ...artifacts.node, status: "cancelled", completedAt: now },
+                    });
+                    yield* emitProviderEvent({
+                      type: "turn_item.updated",
+                      driver: providerDriver,
+                      turnItem: {
+                        ...artifacts.turnItem,
+                        status: "cancelled",
+                        completedAt: now,
+                        updatedAt: now,
+                      },
+                    });
+                  }).pipe(Effect.orDie)
+                : Effect.void,
+            ),
+            Effect.ensuring(
+              Ref.update(pendingRuntimeRequests, (current) => {
+                const updated = new Map(current);
+                updated.delete(String(artifacts.request.id));
+                return updated;
+              }),
+            ),
+          );
 
         yield* client.handleServerNotification("item/agentMessage/delta", (payload) =>
           Effect.gen(function* () {
@@ -4915,10 +5028,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (context === undefined) return;
             yield* emitProviderEvent({
               type: "command_output.delta",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: context.projectionThreadId,
               itemId: idAllocator.derive.turnItemFromProviderItem({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 nativeItemId: payload.itemId,
               }),
               chunk: payload.delta,
@@ -4972,17 +5085,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "plan.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               plan: artifacts.plan,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
           }).pipe(Effect.orDie),
@@ -5007,7 +5120,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               );
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: updated,
               });
             }
@@ -5053,7 +5166,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const now = yield* DateTime.now;
             yield* emitProviderEvent({
               type: "provider_turn.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: context.projectionThreadId,
               providerTurn: {
                 id: context.providerTurnId,
@@ -5061,7 +5174,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 nodeId: context.providerNodeId,
                 runAttemptId: context.subagent === null ? context.input.attemptId : null,
                 nativeTurnRef: {
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   nativeId: payload.turnId,
                   strength: "strong",
                 },
@@ -5143,7 +5256,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               return;
             }
             const pendingRootTurn = (yield* Ref.get(pendingRootTurns)).get(payload.threadId);
-            if (pendingRootTurn !== undefined) {
+            if (pendingRootTurn !== undefined && !sharedDesktop) {
               yield* registerRootTurn({
                 turnInput: pendingRootTurn,
                 nativeTurnId: payload.turn.id,
@@ -5161,7 +5274,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               goalHolds.delete(payload.threadId);
               yield* emitProviderEvent({
                 type: "provider_turn.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 threadId: goalHold.context.projectionThreadId,
                 providerTurn: goalHold.completedTurn,
               });
@@ -5184,6 +5297,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
             // Pause orphan goal turns so they cannot work without an owning run.
             if (
+              !sharedDesktop &&
               rootProviderThreads.has(payload.threadId) &&
               (goalsByNativeThread.get(payload.threadId)?.status === "active" ||
                 goalStops.has(payload.threadId))
@@ -5325,7 +5439,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             );
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: codexRetryTurnItem(context, state, "running", updatedAt),
             });
           }).pipe(Effect.orDie),
@@ -5346,10 +5460,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           else context.runningCompactionItemIds.delete(nativeItemId);
           yield* emitProviderEvent({
             type: "turn_item.updated",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             turnItem: {
               id: idAllocator.derive.turnItemFromProviderItem({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 nativeItemId,
               }),
               threadId: context.projectionThreadId,
@@ -5357,11 +5471,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nodeId: context.providerNodeId,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(nativeItemId),
+              nativeItemRef: adapterItemRef(nativeItemId),
               parentItemId: null,
               ordinal,
               type: "compaction",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               status,
               title:
                 status === "running"
@@ -5506,12 +5620,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const artifacts = yield* buildCommandExecutionArtifacts(context, payload.item);
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
               yield* reportSubagentProgress(context, payload.item.command);
@@ -5525,12 +5639,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const artifacts = yield* buildDynamicToolArtifacts(context, payload.item);
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
               if (artifacts.turnItem.type === "dynamic_tool") {
@@ -5554,12 +5668,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
           }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
@@ -5624,12 +5738,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const artifacts = yield* buildCommandExecutionArtifacts(context, payload.item);
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
               if (settled) {
@@ -5657,7 +5771,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     yield* continuationRequests.offer({
                       threadId: context.projectionThreadId,
                       providerThreadId: context.providerThread.id,
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       // Codex starts a new turn from this text, so nothing is buffered.
                       delivery: "message_text",
                       detail: codexBackgroundCommandDetail(payload.item),
@@ -5697,12 +5811,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const artifacts = yield* buildDynamicToolArtifacts(context, payload.item);
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
               if (settled) {
@@ -5719,12 +5833,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               }
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
               return;
@@ -5739,12 +5853,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
               return;
@@ -5810,12 +5924,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: { ...artifacts.turnItem, viewedImagePath: payload.item.path },
               });
               return;
@@ -5840,17 +5954,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
               yield* emitProviderEvent({
                 type: "node.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 node: artifacts.node,
               });
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: artifacts.turnItem,
               });
               yield* emitProviderEvent({
                 type: "runtime_request.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 threadId: artifacts.node.threadId,
                 runtimeRequest: artifacts.request,
               });
@@ -5954,30 +6068,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             yield* emitProviderEvent({
               type: "runtime_request.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: artifacts.node.threadId,
               runtimeRequest: artifacts.request,
             });
 
-            const resolved = yield* Deferred.await(decision).pipe(
-              Effect.ensuring(
-                Ref.update(pendingRuntimeRequests, (current) => {
-                  const updated = new Map(current);
-                  updated.delete(String(artifacts.request.id));
-                  return updated;
-                }),
-              ),
-            );
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             if (resolved === "acceptForSession" || resolved === "acceptAlways") {
               allowance.add("command");
             }
@@ -6026,30 +6132,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             yield* emitProviderEvent({
               type: "runtime_request.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: artifacts.node.threadId,
               runtimeRequest: artifacts.request,
             });
 
-            const resolved = yield* Deferred.await(decision).pipe(
-              Effect.ensuring(
-                Ref.update(pendingRuntimeRequests, (current) => {
-                  const updated = new Map(current);
-                  updated.delete(String(artifacts.request.id));
-                  return updated;
-                }),
-              ),
-            );
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             if (resolved === "acceptForSession" || resolved === "acceptAlways") {
               allowance.add("file-change");
             }
@@ -6089,30 +6187,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             yield* emitProviderEvent({
               type: "runtime_request.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: artifacts.node.threadId,
               runtimeRequest: artifacts.request,
             });
 
-            const resolved = yield* Deferred.await(decision).pipe(
-              Effect.ensuring(
-                Ref.update(pendingRuntimeRequests, (current) => {
-                  const updated = new Map(current);
-                  updated.delete(String(artifacts.request.id));
-                  return updated;
-                }),
-              ),
-            );
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             return permissionsResponseFromDecision({
               decision: resolved,
               permissions: payload.permissions,
@@ -6176,30 +6266,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             yield* emitProviderEvent({
               type: "runtime_request.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: artifacts.node.threadId,
               runtimeRequest: artifacts.request,
             });
 
-            const resolved = yield* Deferred.await(decision).pipe(
-              Effect.ensuring(
-                Ref.update(pendingRuntimeRequests, (current) => {
-                  const updated = new Map(current);
-                  updated.delete(String(artifacts.request.id));
-                  return updated;
-                }),
-              ),
-            );
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             return toMcpElicitationResponse(payload, resolved);
           }).pipe(Effect.orDie),
         );
@@ -6240,30 +6322,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             yield* emitProviderEvent({
               type: "runtime_request.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: artifacts.node.threadId,
               runtimeRequest: artifacts.request,
             });
 
-            const resolved = yield* Deferred.await(decision).pipe(
-              Effect.ensuring(
-                Ref.update(pendingRuntimeRequests, (current) => {
-                  const updated = new Map(current);
-                  updated.delete(String(artifacts.request.id));
-                  return updated;
-                }),
-              ),
-            );
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             if (resolved === "acceptForSession" || resolved === "acceptAlways") {
               allowance.add("command");
             }
@@ -6308,30 +6382,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             yield* emitProviderEvent({
               type: "runtime_request.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: artifacts.node.threadId,
               runtimeRequest: artifacts.request,
             });
 
-            const resolved = yield* Deferred.await(decision).pipe(
-              Effect.ensuring(
-                Ref.update(pendingRuntimeRequests, (current) => {
-                  const updated = new Map(current);
-                  updated.delete(String(artifacts.request.id));
-                  return updated;
-                }),
-              ),
-            );
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             if (resolved === "acceptForSession" || resolved === "acceptAlways") {
               allowance.add("file-change");
             }
@@ -6368,30 +6434,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             });
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             yield* emitProviderEvent({
               type: "runtime_request.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: artifacts.node.threadId,
               runtimeRequest: artifacts.request,
             });
 
-            const resolved = yield* Deferred.await(answers).pipe(
-              Effect.ensuring(
-                Ref.update(pendingRuntimeRequests, (current) => {
-                  const updated = new Map(current);
-                  updated.delete(String(artifacts.request.id));
-                  return updated;
-                }),
-              ),
-            );
+            const resolved = yield* awaitRuntimeResponse(answers, artifacts);
             return {
               answers: toCodexUserInputAnswers(resolved, artifacts.nativeQuestionIds),
             } satisfies CodexSchema.ToolRequestUserInputResponse;
@@ -6461,7 +6519,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               }
               return {
                 type: "turn.terminal",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 providerThreadId: input.context.providerThread.id,
                 providerTurnId: input.context.providerTurnId,
                 runOrdinal: input.context.input.runOrdinal,
@@ -6491,7 +6549,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
             return {
               type: "turn.terminal",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               providerThreadId: input.context.providerThread.id,
               providerTurnId: input.context.providerTurnId,
               runOrdinal: input.context.input.runOrdinal,
@@ -6524,7 +6582,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           yield* emitProviderEvent(current);
           if (current.status === "failed" && current.failure.class === "usage_limit") {
             const item = makeProviderFailureTurnItem({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               threadId: context.input.threadId,
               runId: context.input.runId,
               nodeId: context.input.rootNodeId,
@@ -6713,7 +6771,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         ) {
           yield* emitProviderEvent({
             type: "provider_turn.updated",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             threadId: hold.context.projectionThreadId,
             providerTurn: hold.completedTurn,
           });
@@ -6786,17 +6844,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const artifacts = yield* buildAgentMessageArtifacts(context, message, true);
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "message.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               message: artifacts.message,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
             state.saved.clear();
@@ -6852,7 +6910,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ) {
                 yield* emitProviderEvent({
                   type: "turn_item.updated",
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   turnItem: codexRetryTurnItem(
                     input.context,
                     providerRetry,
@@ -6916,7 +6974,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 runAttemptId:
                   input.context.subagent === null ? input.context.input.attemptId : null,
                 nativeTurnRef: {
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   nativeId: input.nativeTurnId,
                   strength: "strong",
                 },
@@ -6938,7 +6996,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               if (!holdsForGoal) {
                 yield* emitProviderEvent({
                   type: "provider_turn.updated",
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   threadId: input.context.projectionThreadId,
                   providerTurn: completedTurn,
                 });
@@ -6946,7 +7004,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               if (input.context.subagent !== null) {
                 yield* emitProviderEvent({
                   type: "node.updated",
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   node: {
                     id: input.context.providerNodeId,
                     threadId: input.context.projectionThreadId,
@@ -6967,7 +7025,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 });
                 yield* emitProviderEvent({
                   type: "provider_thread.updated",
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   providerThread: {
                     ...input.context.providerThread,
                     status: "idle",
@@ -6976,7 +7034,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 });
                 yield* emitProviderEvent({
                   type: "node.updated",
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   node: {
                     id: input.context.subagent.subagentNodeId,
                     threadId: input.context.subagent.parentContext.projectionThreadId,
@@ -7022,7 +7080,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   yield* continuationRequests.offer({
                     threadId: parent.projectionThreadId,
                     providerThreadId: parent.providerThread.id,
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     detail: codexNativeSubagentDetail(task),
                     // The detail is the whole wake; Codex buffers no output for it.
                     delivery: "message_text",
@@ -7060,12 +7118,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 });
                 yield* emitProviderEvent({
                   type: "node.updated",
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   node: artifacts.node,
                 });
                 yield* emitProviderEvent({
                   type: "turn_item.updated",
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   turnItem: artifacts.turnItem,
                 });
               }
@@ -7223,6 +7281,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ? context.latestProviderFailure?.nativeCode
               : codexErrorInfoCode(terminal.failureErrorInfo);
           if (
+            sharedDesktop ||
             terminal.status !== "failed" ||
             code !== "serverOverloaded" ||
             context.subagent !== null ||
@@ -7276,7 +7335,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               );
               yield* emitProviderEvent({
                 type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 turnItem: codexRetryTurnItem(context, state, "running", now),
               });
               yield* Effect.sleep(retryDelayMs).pipe(
@@ -7332,7 +7391,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                           );
                           yield* emitProviderEvent({
                             type: "turn_item.updated",
-                            driver: CODEX_PROVIDER,
+                            driver: providerDriver,
                             turnItem: codexRetryTurnItem(
                               context,
                               state,
@@ -7370,7 +7429,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               next.delete(payload.threadId);
               return [true, next] as const;
             });
-            if (compacted)
+            if (compacted && !sharedDesktop)
               // Fork requests off the notification reader so it can read their responses.
               yield* restoreAdditionalContext(payload.threadId).pipe(
                 Effect.forkIn(scope, { startImmediately: true }),
@@ -7418,7 +7477,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             nativeTurnId: nativeId,
             providerThread: turnInput.providerThread,
             providerTurnId: idAllocator.derive.providerTurn({
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               nativeTurnId: nativeId,
             }),
             providerTurnOrdinal: turnInput.providerTurnOrdinal,
@@ -7447,7 +7506,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           } satisfies OrchestrationV2ProviderTurn;
           yield* emitProviderEvent({
             type: "provider_turn.updated",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             threadId: turnInput.threadId,
             providerTurn,
           });
@@ -7460,29 +7519,29 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             );
             yield* emitProviderEvent({
               type: "node.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               node: artifacts.node,
             });
             yield* emitProviderEvent({
               type: "message.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               message: artifacts.message,
             });
             yield* emitProviderEvent({
               type: "turn_item.updated",
-              driver: CODEX_PROVIDER,
+              driver: providerDriver,
               turnItem: artifacts.turnItem,
             });
           }
           yield* emitProviderEvent({
             type: "provider_turn.updated",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             threadId: turnInput.threadId,
             providerTurn: { ...providerTurn, status: "completed", completedAt: now },
           });
           yield* emitRootTerminal(context, {
             type: "turn.terminal",
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             providerThreadId: turnInput.providerThread.id,
             providerTurnId: context.providerTurnId,
             runOrdinal: turnInput.runOrdinal,
@@ -7577,6 +7636,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           threadId: string,
           params: Record<string, unknown>,
         ) {
+          if (sharedDesktop)
+            return yield* client.raw.request("thread/resume", { threadId, excludeTurns: true });
           const resume = client.raw.request("thread/resume", { threadId, ...params });
           return yield* resume.pipe(
             Effect.catchTags({
@@ -7606,29 +7667,63 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
           ) {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
-            const mcpSession = yield* mcpSessions.read(turnInput.threadId);
-            const models = adapterOptions.models === undefined ? [] : yield* adapterOptions.models;
-            const configuredReasoningSummary = yield* client
-              .request("config/read", { cwd: turnInput.runtimePolicy.cwd, includeLayers: false })
-              .pipe(
-                Effect.map((response) => response.config.model_reasoning_summary ?? undefined),
-                Effect.catch(() =>
-                  Effect.logDebug("Codex config read failed.").pipe(Effect.as(undefined)),
-                ),
+            let turnStartParams: Effect.Success<ReturnType<typeof buildCodexTurnStartParams>>;
+            if (sharedDesktop) {
+              const maxRuntimeMode = turnInput.runtimePolicy.maxRuntimeMode;
+              if (maxRuntimeMode && maxRuntimeMode !== "full-access") {
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: providerDriver,
+                  detail: "T3 managed permissions cannot constrain this Codex Desktop session.",
+                });
+              }
+              const thread = yield* readDesktopShareThread(client, threadId);
+              if (thread.status.type === "active") {
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: providerDriver,
+                  detail: "This shared conversation already has an active turn in Codex Desktop.",
+                });
+              }
+              const selectedEffort = getModelSelectionStringOptionValue(
+                turnInput.modelSelection,
+                "reasoningEffort",
               );
-            const turnStartParams = yield* buildCodexTurnStartParams({
-              cyberAccess: codexCyberAccess(models, turnInput.modelSelection.model),
-              nativeThreadId: threadId,
-              codexInput,
-              runtimePolicy: turnInput.runtimePolicy,
-              modelSelection: turnInput.modelSelection,
-              hasT3Mcp: mcpSession !== undefined,
-              browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
-              deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
-              omitServiceTier: adapterOptions.resolveRuntime !== undefined,
-              ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
-              ...(configuredReasoningSummary === undefined ? {} : { configuredReasoningSummary }),
-            });
+              turnStartParams = {
+                threadId,
+                input: codexInput,
+                clientUserMessageId: turnInput.message.messageId,
+                ...(turnInput.modelSelection.model === "default"
+                  ? {}
+                  : { model: turnInput.modelSelection.model }),
+                ...(selectedEffort === undefined
+                  ? {}
+                  : { effort: yield* decodeTurnReasoningEffort(selectedEffort) }),
+              };
+            } else {
+              const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+              const models =
+                adapterOptions.models === undefined ? [] : yield* adapterOptions.models;
+              const configuredReasoningSummary = yield* client
+                .request("config/read", { cwd: turnInput.runtimePolicy.cwd, includeLayers: false })
+                .pipe(
+                  Effect.map((response) => response.config.model_reasoning_summary ?? undefined),
+                  Effect.catch(() =>
+                    Effect.logDebug("Codex config read failed.").pipe(Effect.as(undefined)),
+                  ),
+                );
+              turnStartParams = yield* buildCodexTurnStartParams({
+                cyberAccess: codexCyberAccess(models, turnInput.modelSelection.model),
+                nativeThreadId: threadId,
+                codexInput,
+                runtimePolicy: turnInput.runtimePolicy,
+                modelSelection: turnInput.modelSelection,
+                hasT3Mcp: mcpSession !== undefined,
+                browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
+                deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
+                omitServiceTier: adapterOptions.resolveRuntime !== undefined,
+                ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
+                ...(configuredReasoningSummary === undefined ? {} : { configuredReasoningSummary }),
+              });
+            }
             yield* Ref.update(pendingRootTurns, (current) => {
               const updated = new Map(current);
               updated.set(threadId, turnInput);
@@ -7655,7 +7750,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               previousTurn.input.attemptId !== turnInput.attemptId
             ) {
               return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 detail:
                   "Codex returned a turn belonging to an earlier run. Stop the existing turn before retrying this message.",
               });
@@ -7811,7 +7906,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterTurnStartError({
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     threadId: turnInput.threadId,
                     providerThreadId: turnInput.providerThread.id,
                     runId: turnInput.runId,
@@ -7823,7 +7918,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         const mcpAppsError = (detail: string) => (cause: unknown) =>
           new ProviderAdapter.ProviderAdapterProtocolError({
-            driver: CODEX_PROVIDER,
+            driver: providerDriver,
             detail,
             payload: cause,
           });
@@ -7958,7 +8053,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
-          driver: CODEX_PROVIDER,
+          driver: providerDriver,
           providerSessionId: input.providerSessionId,
           providerSession: session,
           events: Stream.fromEffectRepeat(Queue.take(events)),
@@ -8020,13 +8115,18 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ),
               Effect.flatMap(([mcpSession, stdioMcpServers]) =>
                 client.request("thread/start", {
-                  ...codexThreadRuntimeParams({
-                    threadId: threadInput.threadId,
-                    mcpSession,
-                    stdioMcpServers,
-                    modelSelection: threadInput.modelSelection,
-                    runtimePolicy: threadInput.runtimePolicy,
-                  }),
+                  ...(sharedDesktop
+                    ? {
+                        cwd: threadInput.runtimePolicy.cwd,
+                        model: threadInput.modelSelection.model,
+                      }
+                    : codexThreadRuntimeParams({
+                        threadId: threadInput.threadId,
+                        mcpSession,
+                        stdioMcpServers,
+                        modelSelection: threadInput.modelSelection,
+                        runtimePolicy: threadInput.runtimePolicy,
+                      })),
                   // Codex tags the child's MCP calls with thread_source "subagent".
                   ...(IdAllocator.isDelegatedTaskThread(threadInput.threadId)
                     ? { threadSource: "subagent" }
@@ -8035,6 +8135,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
+                  driver: providerDriver,
                   appThreadId: threadInput.threadId,
                   idAllocator,
                   ownerNodeId: null,
@@ -8046,7 +8147,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterEnsureThreadError({
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     threadId: threadInput.threadId,
                     cause,
                   }),
@@ -8093,7 +8194,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 providerInstanceId: adapterOptions.instanceId,
                 status: "idle",
                 nativeThreadRef: {
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   nativeId: response.thread.id,
                   strength: "strong",
                 },
@@ -8109,13 +8210,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.mapError((cause) =>
                   isCodexActiveWriterError(cause)
                     ? new ProviderAdapter.ProviderAdapterThreadInUseError({
-                        driver: CODEX_PROVIDER,
+                        driver: providerDriver,
                         providerThreadId: threadInput.providerThread.id,
                         detail: CODEX_THREAD_IN_USE_MESSAGE,
                         cause,
                       })
                     : new ProviderAdapter.ProviderAdapterResumeThreadError({
-                        driver: CODEX_PROVIDER,
+                        driver: providerDriver,
                         providerSessionId: input.providerSessionId,
                         providerThreadId: threadInput.providerThread.id,
                         cause,
@@ -8145,7 +8246,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.mapError(
                   (cause) =>
                     new ProviderAdapter.ProviderAdapterTurnStartError({
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       threadId: turnInput.threadId,
                       providerThreadId: turnInput.providerThread.id,
                       runId: turnInput.runId,
@@ -8174,7 +8275,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             Effect.mapError(
               (cause) =>
                 new ProviderAdapter.ProviderAdapterProtocolError({
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   detail: "Failed to inject historical context",
                   cause,
                 }),
@@ -8184,7 +8285,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           startTurn: (turnInput) => {
             const continuation =
               turnInput.restartContinuationOfRunId !== undefined || turnInput.resume === true;
-            const goalCommand = !continuation ? parseGoalCommand(turnInput.message) : null;
+            const goalCommand =
+              !sharedDesktop && !continuation ? parseGoalCommand(turnInput.message) : null;
             if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
             const nativeThreadId = turnInput.providerThread.nativeThreadRef?.nativeId;
             return Effect.gen(function* () {
@@ -8197,7 +8299,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 return yield* activateGoal(turnInput, nativeThreadId, toCodexInput(turnInput));
               }
               // Not in startNativeTurn: a capacity retry would replay its captured, possibly stale title.
-              if (nativeThreadId != null) {
+              if (sharedDesktop && continuation) {
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: providerDriver,
+                  detail:
+                    "Check the shared conversation before sending another message. Interrupted sends are not retried automatically.",
+                });
+              }
+              if (nativeThreadId != null && !sharedDesktop) {
                 yield* applyThreadName(nativeThreadId, turnInput.appThread.title);
               }
               yield* startNativeTurn(
@@ -8208,7 +8317,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterTurnStartError({
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     threadId: turnInput.threadId,
                     providerThreadId: turnInput.providerThread.id,
                     runId: turnInput.runId,
@@ -8242,16 +8351,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 );
               }
 
-              yield* applyServiceTier(threadId, turnInput.modelSelection);
+              if (!sharedDesktop) yield* applyServiceTier(threadId, turnInput.modelSelection);
               const codexInput = yield* toCodexInput(turnInput);
               // turn/steer takes no additionalContext, so notes the thread has not been sent go
               // as quoted user input, the way restoreAdditionalContext resends them.
               const sentContext = (yield* Ref.get(additionalContextByThread)).get(threadId);
-              const unsentNotes = (turnInput.appContext ?? []).filter(
+              const unsentNotes = (sharedDesktop ? [] : (turnInput.appContext ?? [])).filter(
                 (entry) => sentContext?.[entry.key]?.value !== entry.text,
               );
               yield* client.request("turn/steer", {
                 expectedTurnId: activeTurn.nativeTurnId,
+                ...(sharedDesktop ? { clientUserMessageId: turnInput.message.messageId } : {}),
                 input: [
                   ...unsentNotes.map((entry) => ({
                     type: "text" as const,
@@ -8282,7 +8392,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.mapError(
                   (cause) =>
                     new ProviderAdapter.ProviderAdapterSteerRunError({
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       providerThreadId: turnInput.providerThread.id,
                       providerTurnId: turnInput.providerTurnId,
                       cause,
@@ -8302,7 +8412,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             modelSelection,
           }) {
             const threadId = providerThread.nativeThreadRef?.nativeId;
-            if (threadId != null) yield* applyServiceTier(threadId, modelSelection);
+            if (threadId != null && !sharedDesktop)
+              yield* applyServiceTier(threadId, modelSelection);
           }),
           // Dropping this connection's subscription lets the shared app-server
           // shut the native thread (and its MCP servers) down once it is idle.
@@ -8312,7 +8423,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               sessionApprovals.delete(nativeThreadId);
               // Archive also unloads, inline and without thread/closed; resumeNativeThread
               // unarchives it on the next turn.
-              if (unloadInput.archive === true) {
+              if (unloadInput.archive === true && !sharedDesktop) {
                 yield* client.request("thread/archive", { threadId: nativeThreadId });
               } else {
                 // A resume may already wait on the pending entry; replacing it would strand that wait.
@@ -8345,7 +8456,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   cause._tag === "ProviderAdapterProtocolError"
                     ? cause
                     : new ProviderAdapter.ProviderAdapterProtocolError({
-                        driver: CODEX_PROVIDER,
+                        driver: providerDriver,
                         detail: `Failed to unload Codex thread for provider thread ${unloadInput.providerThread.id}`,
                         cause,
                       }),
@@ -8774,7 +8885,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               );
               if (unconfirmed) {
                 return yield* new ProviderAdapter.ProviderAdapterInterruptTimeoutError({
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   providerThreadId: turnInput.providerThread.id,
                   providerTurnId: turnInput.providerTurnId,
                   timeoutMs: CODEX_STOP_CONFIRM_TIMEOUT_MS,
@@ -8802,7 +8913,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   cause._tag === "ProviderAdapterInterruptTimeoutError"
                     ? cause
                     : new ProviderAdapter.ProviderAdapterInterruptError({
-                        driver: CODEX_PROVIDER,
+                        driver: providerDriver,
                         providerThreadId: requestedInput.providerThread.id,
                         providerTurnId: requestedInput.providerTurnId,
                         cause,
@@ -8817,7 +8928,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               );
               if (pending === undefined) {
                 return yield* new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   requestId: requestInput.requestId,
                   cause: toProtocolError(
                     `No pending Codex runtime request ${requestInput.requestId}.`,
@@ -8827,7 +8938,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               if (pending.type === "user_input") {
                 if (requestInput.answers === undefined) {
                   return yield* new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     requestId: requestInput.requestId,
                     cause: toProtocolError(
                       `Codex user input request ${requestInput.requestId} requires answers.`,
@@ -8839,7 +8950,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               }
               if (requestInput.decision === undefined) {
                 return yield* new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   requestId: requestInput.requestId,
                   cause: toProtocolError(
                     `Codex ${pending.requestKind} request ${requestInput.requestId} requires an approval decision.`,
@@ -8854,7 +8965,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   isProviderAdapterRuntimeRequestResponseError(cause)
                     ? cause
                     : new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
-                        driver: CODEX_PROVIDER,
+                        driver: providerDriver,
                         requestId: requestInput.requestId,
                         cause,
                       }),
@@ -8879,7 +8990,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             Effect.mapError(
               (cause) =>
                 new ProviderAdapter.ProviderAdapterProtocolError({
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   detail: "Failed to upload Codex thread feedback.",
                   payload: cause,
                 }),
@@ -8896,7 +9007,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 providerThread: {
                   ...threadInput.providerThread,
                   nativeThreadRef: {
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     nativeId: response.thread.id,
                     strength: "strong" as const,
                   },
@@ -8914,7 +9025,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.mapError(
                   (cause) =>
                     new ProviderAdapter.ProviderAdapterReadThreadSnapshotError({
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       providerThreadId: threadInput.providerThread.id,
                       cause,
                     }),
@@ -8946,7 +9057,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               );
               if (historyMode !== "paginated") {
                 return yield* new ProviderAdapter.ProviderAdapterRollbackThreadError({
-                  driver: CODEX_PROVIDER,
+                  driver: providerDriver,
                   providerThreadId: threadInput.providerThread.id,
                   cause: `Cannot roll back Codex thread ${threadId}: the thread uses legacy history, which Codex 0.156 cannot revert.`,
                 });
@@ -8971,7 +9082,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 providerThread: {
                   ...threadInput.providerThread,
                   nativeThreadRef: {
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     nativeId: response.thread.id,
                     strength: "strong" as const,
                   },
@@ -8990,7 +9101,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.mapError(
                   (cause) =>
                     new ProviderAdapter.ProviderAdapterRollbackThreadError({
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       providerThreadId: threadInput.providerThread.id,
                       cause,
                     }),
@@ -9033,7 +9144,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.mapError(
                   (cause) =>
                     new ProviderAdapter.ProviderAdapterForkThreadError({
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       providerThreadId: threadInput.sourceProviderThread.id,
                       cause,
                     }),
@@ -9046,7 +9157,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 );
                 if (historyMode !== "paginated") {
                   return yield* new ProviderAdapter.ProviderAdapterForkThreadError({
-                    driver: CODEX_PROVIDER,
+                    driver: providerDriver,
                     providerThreadId: threadInput.sourceProviderThread.id,
                     cause: `Cannot fork Codex thread ${threadId} at provider turn ${threadInput.providerTurnId}: the source turn has no native Codex turn reference, and the forked thread uses legacy history which Codex 0.156 cannot revert.`,
                   });
@@ -9058,7 +9169,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   Effect.mapError(
                     (cause) =>
                       new ProviderAdapter.ProviderAdapterForkThreadError({
-                        driver: CODEX_PROVIDER,
+                        driver: providerDriver,
                         providerThreadId: threadInput.sourceProviderThread.id,
                         cause,
                       }),
@@ -9066,6 +9177,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 )).thread;
               }
               return providerThreadFromCodexThread({
+                driver: providerDriver,
                 appThreadId: threadInput.targetThreadId,
                 idAllocator,
                 ownerNodeId: threadInput.ownerNodeId ?? null,
@@ -9085,7 +9197,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.mapError(
                   (cause) =>
                     new ProviderAdapter.ProviderAdapterForkThreadError({
-                      driver: CODEX_PROVIDER,
+                      driver: providerDriver,
                       providerThreadId: threadInput.sourceProviderThread.id,
                       cause,
                     }),
@@ -9100,7 +9212,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           Effect.mapError(
             (cause) =>
               new ProviderAdapter.ProviderAdapterOpenSessionError({
-                driver: CODEX_PROVIDER,
+                driver: providerDriver,
                 providerSessionId: input.providerSessionId,
                 cause,
               }),

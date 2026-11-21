@@ -715,6 +715,7 @@ interface ProviderInstanceCardProps {
   readonly onSelect?: (() => void) | undefined;
   readonly readOnly?: boolean | undefined;
   readonly canWriteSettings?: boolean;
+  readonly canManageDesktopShare?: boolean;
   readonly onUpdate: (nextInstance: ProviderInstanceConfig) => Promise<boolean>;
   readonly onDelete?: (() => void) | undefined;
   readonly headerAction?: ReactNode | undefined;
@@ -789,6 +790,7 @@ export function ProviderInstanceCard({
   onSelect,
   readOnly = false,
   canWriteSettings = true,
+  canManageDesktopShare = true,
   onUpdate,
   onDelete,
   headerAction,
@@ -813,7 +815,7 @@ export function ProviderInstanceCard({
   const gt = useGT();
   const m = useMessages();
   const isDesktopShare = instance.driver === CODEX_DESKTOP_SHARE_DRIVER;
-  const [confirmShareEnable, setConfirmShareEnable] = useState(false);
+  const [shareAction, setShareAction] = useState<"enable" | "disable" | null>(null);
   const shareUnavailableReason =
     liveProvider?.availability === "unavailable"
       ? (liveProvider.unavailableReason ??
@@ -932,8 +934,8 @@ export function ProviderInstanceCard({
   };
 
   const updateEnabled = (value: boolean) => {
-    if (isDesktopShare && value) {
-      setConfirmShareEnable(true);
+    if (isDesktopShare) {
+      if (canManageDesktopShare) setShareAction(value ? "enable" : "disable");
       return;
     }
     if (projectOverride) {
@@ -1185,15 +1187,17 @@ export function ProviderInstanceCard({
     </Popover>
   ) : null;
 
-  const shareConfirmation = isDesktopShare ? (
+  const shareConfirmation = shareAction ? (
     <CodexDesktopShareConfirmation
-      action="enable"
-      open={confirmShareEnable}
+      action={shareAction}
+      open
       unavailableReason={shareUnavailableReason}
-      onOpenChange={setConfirmShareEnable}
+      onOpenChange={(open) => {
+        if (!open) setShareAction(null);
+      }}
       onConfirm={() => {
-        setConfirmShareEnable(false);
-        onUpdate({ ...instance, enabled: true });
+        setShareAction(null);
+        onUpdate({ ...instance, enabled: shareAction === "enable" });
       }}
     />
   ) : null;
@@ -1275,7 +1279,11 @@ export function ProviderInstanceCard({
           <ManagedControl reason={enabled ? undefined : managedDriverReason}>
             <Switch
               checked={enabled}
-              disabled={readOnly || (projectOverride !== undefined && !canWriteSettings)}
+              disabled={
+                readOnly ||
+                (isDesktopShare && (!canManageDesktopShare || !canWriteSettings)) ||
+                (projectOverride !== undefined && !canWriteSettings)
+              }
               onCheckedChange={(checked) => updateEnabled(Boolean(checked))}
               aria-label={gt("Enable {provider}", { provider: displayName })}
             />
@@ -1307,7 +1315,7 @@ export function ProviderInstanceCard({
             type="button"
             size="icon-xs"
             variant="ghost-destructive"
-            disabled={readOnly}
+            disabled={readOnly || (isDesktopShare && enabled && !canManageDesktopShare)}
             onClick={onDelete}
             aria-label={gt("Delete instance {instanceId}", { instanceId })}
           >
@@ -1394,12 +1402,19 @@ export function ProviderInstanceCard({
         {isDesktopShare ? (
           <SettingsRow
             title={gt("Desktop on this host")}
-            description={shareUnavailableReason}
+            description={
+              canManageDesktopShare
+                ? shareUnavailableReason
+                : gt("Manage the bridge from T3 Code on the Windows host.")
+            }
             control={
               <Switch
                 checked={enabled}
                 disabled={
-                  readOnly || !canWriteSettings || (!enabled && managedDriverReason !== undefined)
+                  readOnly ||
+                  !canWriteSettings ||
+                  !canManageDesktopShare ||
+                  (!enabled && managedDriverReason !== undefined)
                 }
                 onCheckedChange={(checked) => updateEnabled(Boolean(checked))}
                 aria-label={gt("Enable {provider}", { provider: displayName })}
@@ -1524,7 +1539,9 @@ export function ProviderInstanceCard({
           </div>
         </SettingsSection>
       ) : null}
-      {environmentId !== undefined && liveProvider?.driver === "acpRegistry" ? (
+      {environmentId !== undefined &&
+      liveProvider &&
+      (liveProvider.driver === "acpRegistry" || isDesktopShare) ? (
         <AcpSessionManagementSection
           environmentId={environmentId}
           instanceId={instanceId}
