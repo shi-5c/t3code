@@ -69,6 +69,13 @@ function Restore-Transaction([string]$Journal, $Transaction, $Managed, [hashtabl
 
     if ([IO.File]::Exists($Managed.value) -and $Transaction.imageHash -and
         (Get-FileHash -LiteralPath $Managed.value -Algorithm SHA256).Hash -ceq $Transaction.imageHash) {
+        $endpoint = [IO.Path]::ChangeExtension($Managed.value, '.endpoint')
+        [IO.File]::Delete($endpoint)
+        $name = [IO.Path]::GetFileName($endpoint)
+        $generationFile = '^' + [regex]::Escape($name) + '\.[0-9a-f]{32}\.(key|pending)$'
+        foreach ($file in Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($endpoint)) -File -Filter "$name.*") {
+            if ($file.Name -cmatch $generationFile) { [IO.File]::Delete($file.FullName) }
+        }
         [IO.File]::Delete($Managed.value)
     }
     [IO.File]::Delete($Journal)

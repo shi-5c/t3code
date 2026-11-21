@@ -11,6 +11,9 @@ import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
+import { buildCodexInitializeParams } from "../CodexProvider.ts";
+import { locateDesktopShareConnector, openDesktopShareClient } from "./CodexDesktopShareRuntime.ts";
+
 const Preflight = Schema.fromJsonString(
   Schema.Struct({
     versions: Schema.Array(Schema.String.check(Schema.isPattern(/^\d{1,6}(\.\d{1,6}){3}$/))),
@@ -67,7 +70,23 @@ const preflight = Effect.fn("CodexDesktopShareDriver.preflight")(function* () {
   const version = versions[0];
   if (!version) return "The Codex Desktop Windows package was not found for the T3 host user.";
   if (!hasCli) return `Codex Desktop ${version} has an unrecognized CLI layout.`;
-  if (hasOverride) return `Codex Desktop ${version} has an existing CODEX_CLI_PATH override.`;
+  if (hasOverride) {
+    const connector = yield* locateDesktopShareConnector();
+    if (!connector) return `Codex Desktop ${version} has an existing CODEX_CLI_PATH override.`;
+    const connected = yield* Effect.gen(function* () {
+      const client = yield* openDesktopShareClient(connector);
+      yield* client.request("initialize", buildCodexInitializeParams());
+      yield* client.notify("initialized", undefined);
+      return true;
+    }).pipe(
+      Effect.scoped,
+      Effect.timeout("10 seconds"),
+      Effect.orElseSucceed(() => false),
+    );
+    return connected
+      ? `Codex Desktop ${version} is sharing its app-server. T3 conversation projection is unavailable.`
+      : `Codex Desktop ${version} did not accept a T3 connection to the shared app-server.`;
+  }
   return `Codex Desktop ${version} has no verified shared-session runtime.`;
 });
 

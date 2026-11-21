@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Preflight', 'Enable', 'Status', 'Restore')] [string]$Action = 'Preflight',
-    [switch]$ReplaceExisting
+    [switch]$ReplaceExisting,
+    [switch]$Share
 )
 
 Set-StrictMode -Version Latest
@@ -224,13 +225,19 @@ function Test-ForwardChain($Install, [string]$Candidate) {
     return $false
 }
 
+function Test-ShareEndpoint([string]$Candidate) {
+    $endpoint = [IO.Path]::ChangeExtension($Candidate, '.endpoint')
+    return [IO.File]::Exists($endpoint)
+}
+
 function Start-Desktop($Install, [string]$Candidate) {
     $launch = @{ FilePath = (Join-Path $env:SystemRoot 'explorer.exe')
         ArgumentList = ('shell:AppsFolder\' + $Install.AppId); WindowStyle = 'Hidden' }
     Start-Process @launch
     $timeout = [Diagnostics.Stopwatch]::StartNew()
     while ($timeout.Elapsed.TotalSeconds -lt 30) {
-        if ($Candidate -and (Test-ForwardChain $Install $Candidate)) { return }
+        if ($Candidate -and (Test-ForwardChain $Install $Candidate) -and
+            (-not $Share -or (Test-ShareEndpoint $Candidate))) { return }
         if (-not $Candidate) {
             foreach ($entry in @(Get-DesktopProcesses $Install)) {
                 $process = Get-Process -Id $entry.ProcessId -ErrorAction SilentlyContinue
@@ -246,10 +253,12 @@ function Install-Forwarder($Install, [string]$Candidate) {
     $binding = [IO.Path]::ChangeExtension($Candidate, '.cs')
     try {
         $source = 'internal static class PinnedCli { internal const string Path = @"' +
-            $Install.Cli.Replace('"', '""') + '"; }'
+            $Install.Cli.Replace('"', '""') + '"; internal const string DesktopPath = @"' +
+            $Install.Desktop.Replace('"', '""') + '"; internal const bool Share = ' +
+            $Share.IsPresent.ToString().ToLowerInvariant() + '; }'
         [IO.File]::WriteAllText($binding, $source, [Text.Encoding]::Unicode)
-        $compilerArgs = @('/nologo', '/optimize+', '/target:exe', '/platform:x64',
-            "/out:$Candidate", (Join-Path $PSScriptRoot 'Forwarder.cs'), $binding)
+        $compilerArgs = @('/nologo', '/optimize+', '/target:exe', '/platform:x64', '/reference:System.Security.dll',
+            "/out:$Candidate", (Join-Path $PSScriptRoot 'Forwarder.cs'), (Join-Path $PSScriptRoot 'ShareBridge.cs'), $binding)
         & $compiler @compilerArgs | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists($Candidate)) {
             throw 'Could not build the Codex Desktop stock CLI forwarder.'
@@ -269,13 +278,19 @@ $operations = @{
     }
     Stop = { Assert-InteractiveSession; Stop-Desktop (Get-DesktopInstall) }
     Start = { param($candidate) Start-Desktop (Get-DesktopInstall) $candidate }
-    IsForwarding = { param($candidate) Test-ForwardChain (Get-DesktopInstall) $candidate }
+    IsForwarding = {
+        param($candidate)
+        (Test-ForwardChain (Get-DesktopInstall) $candidate) -and (-not $Share -or (Test-ShareEndpoint $candidate))
+    }
 }
 
 if ($Action -in @('Preflight', 'Enable')) {
     Assert-InteractiveSession
     $install = Get-DesktopInstall
     Assert-ReviewedInstall $install
+    if ($Share -and $install.Version -ne '26.1117.4957.0') {
+        throw 'This Codex Desktop version has no verified WebSocket launch configuration.'
+    }
 }
 
 if ($Action -eq 'Preflight') {

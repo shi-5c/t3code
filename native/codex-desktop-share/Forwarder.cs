@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -74,6 +75,10 @@ internal static class Forwarder
     [DllImport("kernel32.dll")]
     private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationProcess(IntPtr process, int informationClass,
+        [Out] IntPtr[] information, int size, out int returned);
+
     private static IntPtr InheritableStandardHandle(int id)
     {
         var handle = GetStdHandle(id);
@@ -82,7 +87,7 @@ internal static class Forwarder
         return handle;
     }
 
-    private static void AppendArgument(StringBuilder commandLine, string value)
+    internal static void AppendArgument(StringBuilder commandLine, string value)
     {
         commandLine.Append('"');
         int backslashes = 0;
@@ -101,8 +106,47 @@ internal static class Forwarder
         commandLine.Append('"');
     }
 
+    private static bool IsDesktopParent()
+    {
+        using (var self = Process.GetCurrentProcess())
+        {
+            var basic = new IntPtr[6];
+            int returned;
+            if (NtQueryInformationProcess(self.Handle, 0, basic, basic.Length * IntPtr.Size, out returned) != 0)
+                return false;
+            try
+            {
+                using (var parent = Process.GetProcessById(basic[5].ToInt32()))
+                    return parent.SessionId == self.SessionId && parent.StartTime <= self.StartTime &&
+                        String.Equals(parent.MainModule.FileName, PinnedCli.DesktopPath, StringComparison.OrdinalIgnoreCase);
+            }
+            catch (ArgumentException) { return false; }
+            catch (InvalidOperationException) { return false; }
+            catch (Win32Exception) { return false; }
+        }
+    }
+
     private static int Main(string[] arguments)
     {
+        if (PinnedCli.Share && arguments.Length == 1 && arguments[0] == "--t3-desktop-share-connect")
+            return RunShared(() => ShareBridge.RunClient());
+        if (PinnedCli.Share && ShareBridge.IsDesktopOwner(arguments) && IsDesktopParent())
+            return RunShared(() => {
+                var sharedJob = CreateJobObject(IntPtr.Zero, null);
+                try
+                {
+                    var limits = new JobLimits { Flags = 0x2000 };
+                    if (sharedJob == IntPtr.Zero ||
+                        !SetInformationJobObject(sharedJob, 9, ref limits, Marshal.SizeOf(limits)))
+                        throw new Win32Exception();
+                    return ShareBridge.RunOwner(arguments, process => {
+                        if (!AssignProcessToJobObject(sharedJob, process.Handle))
+                            throw new Win32Exception();
+                    });
+                }
+                finally { if (sharedJob != IntPtr.Zero) CloseHandle(sharedJob); }
+            });
+
         var commandLine = new StringBuilder();
         AppendArgument(commandLine, PinnedCli.Path);
         foreach (string argument in arguments)
@@ -153,6 +197,18 @@ internal static class Forwarder
             if (job != IntPtr.Zero) CloseHandle(job);
             if (child.Thread != IntPtr.Zero) CloseHandle(child.Thread);
             if (child.Process != IntPtr.Zero) CloseHandle(child.Process);
+        }
+    }
+
+    private static int RunShared(Func<int> operation)
+    {
+        try { return operation(); }
+        catch (Exception error)
+        {
+            // Provider errors may contain paths, protocol messages or authentication details.
+            Console.Error.WriteLine("Codex Desktop Share connection failed ({0}).",
+                error.GetBaseException().GetType().Name);
+            return 70;
         }
     }
 }

@@ -43,7 +43,12 @@ try {
     Assert-True ((Invoke-ShareLifecycle -Action Enable -Root $root -Operations $operations) -eq 'Forwarding') 'Enable is idempotent.'
     $state.forwarding = $false
     Assert-True ((Invoke-ShareLifecycle -Action Status -Root $root -Operations $operations) -eq 'Configured') 'A closed Desktop is configured without a live forwarding chain.'
+    $endpoint = [IO.Path]::ChangeExtension($state.setting.value, '.endpoint')
+    $pendingKey = "$endpoint.$([Guid]::NewGuid().ToString('N')).key"
+    [IO.File]::WriteAllText($endpoint, 'fixture endpoint')
+    [IO.File]::WriteAllText($pendingKey, 'fixture incomplete startup')
     $null = Invoke-ShareLifecycle -Action Restore -Root $root -Operations $operations
+    Assert-True (-not [IO.File]::Exists($endpoint) -and -not [IO.File]::Exists($pendingKey)) 'Restore removes data owned by the retired bridge generation.'
     Assert-True (-not $state.setting.present) 'Restore preserves a missing registry value.'
     Assert-True (($state.events -join ',') -eq 'stop,write,start-bridge,write,stop,start-stock') 'Restore resets the setting before launching stock.'
     Assert-True ((Invoke-ShareLifecycle -Action Restore -Root $root -Operations $operations) -eq 'Unconfigured') 'Restore is idempotent.'
@@ -73,6 +78,48 @@ try {
     Assert-True ((Invoke-ShareLifecycle -Action Status -Root $root -Operations $operations) -eq 'RestartPending') 'An interrupted restore is resumable.'
     $state.failStop = $false
     Assert-True ((Invoke-ShareLifecycle -Action Restore -Root $root -Operations $operations) -eq 'Restored') 'Retry completes the interrupted restoration.'
+
+    $source = Join-Path $root 'BridgeAssertions.cs'
+    $binary = Join-Path $root 'bridge-assertions.exe'
+    [IO.File]::WriteAllText($source, @'
+using System;
+using System.Linq;
+
+internal static class PinnedCli
+{
+    internal const string Path = "codex.exe";
+    internal const string DesktopPath = "desktop.exe";
+    internal const bool Share = true;
+}
+
+internal static class BridgeAssertions
+{
+    private static int Main()
+    {
+        var owner = new[] { "-c", "features.code_mode_host=true", "app-server",
+            "--analytics-default-enabled", "-c", "features.prefer_mxc=true", "-c",
+            "plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true" };
+        if (!ShareBridge.IsDesktopOwner(owner))
+            throw new Exception("The observed Desktop owner arguments must enter the bridge.");
+        if (!ShareBridge.IsDesktopOwner(owner.Concat(new[] {
+            "--mcp-launch-cwd", "server", "root with spaces", "workdir" }).ToArray()))
+            throw new Exception("Known plugin launch working directories must be forwarded.");
+        if (ShareBridge.IsDesktopOwner(owner.Concat(new[] { "--listen", "stdio://" }).ToArray()) ||
+            ShareBridge.IsDesktopOwner(owner.Concat(new[] { "--print-startup-config" }).ToArray()) ||
+            ShareBridge.IsDesktopOwner(new[] { "-c", "features.prefer_mxc=true", "app-server" }))
+            throw new Exception("Alternate transports, setup queries and ambiguous owners must use stock CLI behavior.");
+        return 0;
+    }
+}
+'@)
+    $compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    $compile = @('/nologo', '/target:exe', '/platform:x64', '/reference:System.Security.dll',
+        '/main:BridgeAssertions', "/out:$binary", (Join-Path $PSScriptRoot 'Forwarder.cs'),
+        (Join-Path $PSScriptRoot 'ShareBridge.cs'), $source)
+    & $compiler @compile
+    Assert-True ($LASTEXITCODE -eq 0) 'The Windows forwarder must compile.'
+    & $binary
+    Assert-True ($LASTEXITCODE -eq 0) 'The bridge launch classifier must preserve stock calls.'
     'Codex Desktop lifecycle cases passed.'
 } finally {
     if ([IO.Directory]::Exists($root)) {
