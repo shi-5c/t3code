@@ -77,6 +77,69 @@ const layerTest = Layer.mergeAll(
   ),
 );
 
+it.effect(
+  "rejects offline Desktop Share creation and cross-provider commands before writing events",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("desktop-share-admission");
+      const share = {
+        ...modelSelection,
+        instanceId: ProviderInstanceId.make("codexDesktopShare_test"),
+      };
+      const create = {
+        type: "thread.create",
+        commandId: CommandId.make("create-desktop-share"),
+        threadId,
+        projectId: ProjectId.make("project:desktop-share"),
+        title: "Share admission",
+        modelSelection: share,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      } as const;
+      const unavailable = yield* Effect.flip(orchestrator.dispatch(create));
+      assert.instanceOf(unavailable, Orchestrator.OrchestratorDispatchError);
+
+      yield* orchestrator.dispatch({
+        ...create,
+        commandId: CommandId.make("create-codex"),
+        modelSelection,
+      });
+      const sequence = yield* orchestrator.getThreadEventSequence(threadId);
+      for (const type of ["provider.switch", "thread.model-selection.set"] as const) {
+        const error = yield* Effect.flip(
+          orchestrator.dispatch({
+            type,
+            commandId: CommandId.make(type),
+            threadId,
+            modelSelection: share,
+          }),
+        );
+        assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
+      }
+      const send = yield* Effect.flip(
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("send-with-share-override"),
+          threadId,
+          messageId: MessageId.make("share-override"),
+          modelSelection: share,
+          text: "Hello",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        }),
+      );
+      assert.instanceOf(send, Orchestrator.OrchestratorDispatchError);
+      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
+    }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect.each(
   (["provider.switch", "thread.model-selection.set"] as const).flatMap((type) =>
     [

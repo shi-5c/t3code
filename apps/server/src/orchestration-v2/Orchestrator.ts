@@ -23,6 +23,10 @@ import {
   legacyThreadPullRequestKey,
 } from "../sourceControl/threadPullRequests.ts";
 import {
+  allowsDesktopShareSelection,
+  CODEX_DESKTOP_SHARE_DRIVER,
+  codexDesktopShareThreadOwner,
+  isCodexDesktopShareInstance,
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type ChatAttachment,
   CommandId,
@@ -1637,6 +1641,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const providerAdapters = yield* ProviderAdapterRegistryV2;
+  const requireDesktopShareSelection = Effect.fn("Orchestrator.requireDesktopShareSelection")(
+    function* (
+      command: OrchestrationV2Command,
+      thread: OrchestrationV2AppThread | null,
+      instanceId: ProviderInstanceId,
+    ) {
+      if (!allowsDesktopShareSelection(thread, instanceId)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Codex Desktop Share must keep its original provider instance.",
+        });
+      }
+      if (
+        !isCodexDesktopShareInstance(instanceId) &&
+        (thread === null || codexDesktopShareThreadOwner(thread) === null)
+      )
+        return;
+      const adapter = yield* Effect.option(providerAdapters.get(instanceId));
+      if (Option.isNone(adapter) || adapter.value.driver !== CODEX_DESKTOP_SHARE_DRIVER) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Codex Desktop Share requires a verified connection. Check the provider status on its host.",
+        });
+      }
+    },
+  );
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
@@ -2522,6 +2555,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
       const modelSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const desktopShareOwner = codexDesktopShareThreadOwner(projection.thread);
+      if (!allowsDesktopShareSelection(projection.thread, modelSelection.instanceId)) return;
+      if (desktopShareOwner !== null) {
+        const adapter = yield* Effect.option(providerAdapters.get(desktopShareOwner));
+        if (Option.isNone(adapter) || adapter.value.driver !== CODEX_DESKTOP_SHARE_DRIVER) return;
+      }
       const queuedRun = {
         ...storedQueuedRun,
         modelSelection,
@@ -3985,6 +4024,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.driver": command.modelSelection.instanceId,
     });
 
+    yield* requireDesktopShareSelection(command, null, command.modelSelection.instanceId);
+
     // Tombstones reserve their ids too; recreating one would overwrite its history.
     const existing = yield* findThread(command.threadId);
     if (existing !== null) {
@@ -4679,6 +4720,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const providerSwitchPlan =
       command.type === "thread.model-selection.set" || command.type === "provider.switch"
         ? yield* Effect.gen(function* () {
+            yield* requireDesktopShareSelection(command, thread, command.modelSelection.instanceId);
             yield* providerAdapters.get(command.modelSelection.instanceId).pipe(
               Effect.mapError(
                 (cause) =>
@@ -5947,6 +5989,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
+    if (codexDesktopShareThreadOwner(sourceProjection.thread) !== null) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Branching a Codex Desktop Share conversation requires native fork support.",
+      });
+    }
     // Read under the source's lock; validate the modes copied here, not an earlier read.
     yield* refuseAboveDispatchModeLimit(command, command.sourceThreadId, sourceProjection.thread);
     if (sourceProjection.thread.deletedAt !== null) {
@@ -6285,6 +6334,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly notification?: OrchestrationV2ConversationMessage["notification"];
     readonly forceRestart: boolean;
   }) {
+    yield* requireDesktopShareSelection(
+      input.command,
+      input.projection.thread,
+      input.modelSelection.instanceId,
+    );
     const targetRun = input.projection.runs.find((candidate) => candidate.id === input.targetRunId);
     if (targetRun === undefined) {
       return yield* new OrchestratorDispatchError({
@@ -7094,6 +7148,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             keepMessageId: command.messageId,
           }
         : undefined,
+    );
+    yield* requireDesktopShareSelection(
+      command,
+      projection.thread,
+      (command.modelSelection ?? projection.thread.modelSelection).instanceId,
     );
     if (command.steerFollowUpOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.steerFollowUpOfRunId);
@@ -11266,6 +11325,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? runtimeRequest.responseCapability.providerSessionId
           : null;
       const providerSession = context.session;
+      const thread = context.thread;
+      yield* requireDesktopShareSelection(command, thread, thread.providerInstanceId);
       if (providerSessionId !== null && providerSession === undefined) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -11301,9 +11362,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             cause: "The question for this request was not found.",
           });
         }
-        const thread = yield* projectionStore
-          .getThread(command.threadId)
-          .pipe(mapDispatchError(command));
         const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
         if (
           !resolveProjectProviderInstanceEnabled(

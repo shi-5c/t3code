@@ -152,6 +152,7 @@ export interface EnvironmentThreadShell {
   readonly projectId: ProjectId;
   readonly title: string;
   readonly providerInstanceId: ProviderInstanceId;
+  readonly threadType?: OrchestrationV2ThreadShell["threadType"];
   readonly modelSelection: OrchestrationV2ThreadShell["modelSelection"];
   readonly runtimeMode: OrchestrationV2ThreadShell["runtimeMode"];
   readonly interactionMode: OrchestrationV2ThreadShell["interactionMode"];
@@ -301,6 +302,7 @@ export function presentThreadShell(
         ? formatSubagentDisplayTitle(thread.title)
         : thread.title,
     providerInstanceId: thread.providerInstanceId,
+    ...(thread.threadType === undefined ? {} : { threadType: thread.threadType }),
     modelSelection: thread.modelSelection,
     runtimeMode: thread.runtimeMode,
     interactionMode: thread.interactionMode,

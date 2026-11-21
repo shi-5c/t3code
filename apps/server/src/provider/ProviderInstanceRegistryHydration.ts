@@ -1,4 +1,5 @@
 import {
+  CODEX_DESKTOP_SHARE_DRIVER,
   defaultInstanceIdForDriver,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -72,7 +73,12 @@ export const deriveProviderInstanceConfigMap = (
       if (projectOverride.enabled !== true) continue;
       const instanceId = rawInstanceId as ProviderInstanceId;
       const existing = merged[instanceId];
-      if (existing === undefined || resolveProviderInstanceEnabled(existing)) continue;
+      if (
+        existing === undefined ||
+        existing.driver === CODEX_DESKTOP_SHARE_DRIVER ||
+        resolveProviderInstanceEnabled(existing)
+      )
+        continue;
       merged[instanceId] = {
         ...existing,
         enabled: true,

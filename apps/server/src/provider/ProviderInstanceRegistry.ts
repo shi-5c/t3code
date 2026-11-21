@@ -1,5 +1,7 @@
 import {
+  CODEX_DESKTOP_SHARE_DRIVER,
   providerInstanceConfigEnabledFlag,
+  resolveProviderInstanceEnabled,
   ProviderInstanceId,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
@@ -180,6 +182,7 @@ const carryCheckedSecret = <R>(
 
 /** Conflicting saved flags must preserve any explicit disable. */
 const resolveEntryEnabled = (entry: ProviderInstanceConfig, typedConfig: unknown): boolean => {
+  if (entry.driver === CODEX_DESKTOP_SHARE_DRIVER) return resolveProviderInstanceEnabled(entry);
   const rawConfigEnabled = providerInstanceConfigEnabledFlag(entry.config);
   if (entry.enabled === false || rawConfigEnabled === false) {
     return false;
@@ -332,11 +335,14 @@ const buildEntry = Effect.fn("ProviderInstanceRegistry.buildEntry")(function* <R
     })
     .pipe(Effect.provideService(Scope.Scope, childScope), Effect.result);
   if (createResult._tag === "Failure") {
-    yield* Effect.logError("Failed to create provider instance", {
-      instanceId: rawInstanceId,
-      driver: entry.driver,
-      detail: createResult.failure.detail,
-    });
+    const shareUnavailable = entry.driver === CODEX_DESKTOP_SHARE_DRIVER;
+    if (!shareUnavailable) {
+      yield* Effect.logError("Failed to create provider instance", {
+        instanceId: rawInstanceId,
+        driver: entry.driver,
+        detail: createResult.failure.detail,
+      });
+    }
     yield* Scope.close(childScope, Exit.void).pipe(Effect.ignore);
     return {
       kind: "unavailable" as const,
@@ -345,7 +351,10 @@ const buildEntry = Effect.fn("ProviderInstanceRegistry.buildEntry")(function* <R
         instanceId,
         displayName: entry.displayName,
         accentColor: entry.accentColor,
-        reason: `Driver '${entry.driver}' failed to create instance: ${createResult.failure.detail}`,
+        enabled: shareUnavailable && enabled,
+        reason: shareUnavailable
+          ? createResult.failure.detail
+          : `Driver '${entry.driver}' failed to create instance: ${createResult.failure.detail}`,
       }),
     };
   }

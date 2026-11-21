@@ -1,4 +1,6 @@
 import {
+  CODEX_DESKTOP_SHARE_DRIVER,
+  isCodexDesktopShareInstance,
   DEFAULT_SERVER_SETTINGS,
   ModelSelection,
   ProjectId,
@@ -22,6 +24,7 @@ import {
   type SecretReference,
   withIdleCompaction,
 } from "@t3tools/contracts";
+import * as NodeUtil from "node:util";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -251,6 +254,48 @@ function ensureProviderInstanceMutationAllowed(
   return Effect.void;
 }
 
+function validateDesktopShareSettings(
+  current: ServerSettings,
+  next: ServerSettings,
+  settingsPath: string,
+): Effect.Effect<void, ServerSettingsError> {
+  for (const [id, instance] of Object.entries(next.providerInstances)) {
+    const previous = current.providerInstances[ProviderInstanceId.make(id)];
+    const share = instance.driver === CODEX_DESKTOP_SHARE_DRIVER;
+    const previouslyShared = previous?.driver === CODEX_DESKTOP_SHARE_DRIVER;
+    if (!share && !previouslyShared && !isCodexDesktopShareInstance(id)) continue;
+    if (NodeUtil.isDeepStrictEqual(previous, instance)) continue;
+    if (
+      !share ||
+      !isCodexDesktopShareInstance(id) ||
+      (previous !== undefined && !previouslyShared) ||
+      (instance.environment?.length ?? 0) > 0 ||
+      (instance.config !== undefined && !NodeUtil.isDeepStrictEqual(instance.config, {}))
+    ) {
+      return Effect.fail(
+        new ServerSettingsError({
+          settingsPath,
+          operation: "configure-codex-desktop-share",
+          providerInstanceId: id,
+        }),
+      );
+    }
+    if (
+      resolveProviderInstanceEnabled(instance) &&
+      !(previouslyShared && resolveProviderInstanceEnabled(previous))
+    ) {
+      return Effect.fail(
+        new ServerSettingsError({
+          settingsPath,
+          operation: "enable-codex-desktop-share",
+          providerInstanceId: id,
+        }),
+      );
+    }
+  }
+  return Effect.void;
+}
+
 export class ServerSettingsService extends Context.Service<
   ServerSettingsService,
   {
@@ -313,7 +358,11 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
   ): Effect.Effect<ServerSettings, ServerSettingsError> =>
     writeSemaphore.withPermits(1)(
       Ref.get(currentSettingsRef).pipe(
-        Effect.flatMap(update),
+        Effect.flatMap((current) =>
+          update(current).pipe(
+            Effect.tap((next) => validateDesktopShareSettings(current, next, "test settings")),
+          ),
+        ),
         Effect.flatMap(normalizeServerSettings),
         Effect.tap((nextSettings) => Ref.set(currentSettingsRef, nextSettings)),
         Effect.map(resolveTextGenerationProvider),
@@ -1236,6 +1285,7 @@ const make = Effect.gen(function* () {
             managedBy: managedPolicy?.organization,
           });
         }
+        yield* validateDesktopShareSettings(current, vettedProviders.settings, settingsPath);
         // After vetting, which can keep stored variables a policy hides from clients.
         const persisted = yield* persistSettingsSecrets(
           current,

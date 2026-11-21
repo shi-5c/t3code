@@ -91,6 +91,7 @@ import {
   buildModelOptions,
   isModelSelectionUnavailable,
   serverConfigForCwd,
+  serverConfigForThreadProviders,
 } from "../../lib/modelOptions";
 import { useComposerTextRole } from "../settings/appearance/useScaledTextRole";
 import type { RemoteClientConnectionState } from "../../lib/connection";
@@ -599,7 +600,10 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
     ? undefined
     : currentModelSelection.instanceId;
   const modelOptions = buildModelOptions(
-    serverConfigForCwd(props.serverConfig, props.projectCwd),
+    serverConfigForThreadProviders(
+      serverConfigForCwd(props.serverConfig, props.projectCwd),
+      props.isDraft ? null : props.selectedThread,
+    ),
     currentModelSelection,
     lockedProviderInstanceId,
     props.selectedThread.projectId,

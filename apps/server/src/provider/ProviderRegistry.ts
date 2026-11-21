@@ -1,5 +1,7 @@
 import {
+  CODEX_DESKTOP_SHARE_DRIVER,
   defaultInstanceIdForDriver,
+  isCodexDesktopShareInstance,
   isProviderWorkspaceSnapshotCurrent,
   isProviderWorkspaceSnapshotPending,
   ProviderDriverKind,
@@ -792,7 +794,15 @@ export const layer = Layer.effect(
         // Syncing first keeps a refresh right after a rebuild from probing the replaced instance.
         yield* manifestService.current.pipe(
           Effect.flatMap(({ updatedAt }) =>
-            syncLiveSourcesAndContinue.pipe(
+            instanceRegistry.listUnavailable.pipe(
+              Effect.flatMap((providers) =>
+                instanceRegistryMutator.rebuild(
+                  providers
+                    .filter((provider) => provider.driver === CODEX_DESKTOP_SHARE_DRIVER)
+                    .map((provider) => provider.instanceId),
+                ),
+              ),
+              Effect.andThen(syncLiveSourcesAndContinue),
               Effect.andThen(Ref.get(liveSubsRef)),
               Effect.flatMap((instances) =>
                 Effect.forEach(instances.values(), (instance) => refreshOneSource(instance), {
@@ -826,6 +836,14 @@ export const layer = Layer.effect(
       instanceId: ProviderInstanceId,
     ) {
       yield* refreshHostPath;
+      if (
+        isCodexDesktopShareInstance(instanceId) &&
+        (yield* instanceRegistry.listUnavailable).some(
+          (provider) => provider.instanceId === instanceId,
+        )
+      ) {
+        yield* instanceRegistryMutator.rebuild([instanceId]);
+      }
       yield* syncLiveSourcesAndContinue;
       const instance = (yield* Ref.get(liveSubsRef)).get(instanceId);
       if (!instance) {

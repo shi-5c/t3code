@@ -469,6 +469,37 @@ describe("EnvironmentProviderSettings routing", () => {
 });
 
 describe("EnvironmentProviderSettings provider list", () => {
+  it("shows the Desktop Share preflight failure before asking to restart", async () => {
+    await setup();
+    const shareId = ProviderInstanceId.make("codexDesktopShare_test");
+    const driver = ProviderDriverKind.make("codexDesktopShare");
+    state.settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      providerInstances: {
+        [shareId]: { driver, enabled: false, displayName: "Codex Desktop Share" },
+      },
+    };
+    const reason = "Codex Desktop has an existing CODEX_CLI_PATH override.";
+    await setProviders([
+      {
+        ...provider(),
+        instanceId: shareId,
+        driver,
+        enabled: false,
+        availability: "unavailable",
+        unavailableReason: reason,
+      },
+    ]);
+    await using screen = await render(panel({ targetInstanceId: shareId }));
+    await screen.getByRole("switch", { name: "Enable Codex Desktop Share" }).first().click();
+    const confirmation = screen.getByRole("alertdialog", {
+      name: "Codex Desktop Share is unavailable",
+    });
+    await expect.element(confirmation.getByText(reason)).toBeVisible();
+    await confirmation.getByRole("button", { name: "Close" }).click();
+    expect(state.mutateProviderInstance).not.toHaveBeenCalled();
+  });
+
   it("selects a provider when its row is clicked near the edge", async () => {
     await setup();
     await setProviders([provider()]);

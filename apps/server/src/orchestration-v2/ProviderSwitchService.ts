@@ -1,4 +1,5 @@
 import {
+  allowsDesktopShareSelection,
   ModelSelection,
   OrchestrationV2ThreadProjection,
   ProviderSessionId,
@@ -63,6 +64,13 @@ export const layer: Layer.Layer<
     return ProviderSwitchServiceV2.of({
       plan: Effect.fn("ProviderSwitchService.plan")(
         function* ({ projection, targetModelSelection }) {
+          if (!allowsDesktopShareSelection(projection.thread, targetModelSelection.instanceId)) {
+            return yield* new ProviderSwitchPlanError({
+              threadId: projection.thread.id,
+              targetProviderInstanceId: targetModelSelection.instanceId,
+              cause: "Codex Desktop Share must keep its original provider instance.",
+            });
+          }
           const current = projection.thread.modelSelection;
           const instanceChanged = current.instanceId !== targetModelSelection.instanceId;
           const getMetadata = (instanceId: typeof current.instanceId) =>

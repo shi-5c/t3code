@@ -352,6 +352,7 @@ export type ProjectionThreadProviderContext = Pick<
   "thread" | "providerSessions" | "providerThreads"
 >;
 export interface ProjectionRuntimeResponseContext {
+  readonly thread: OrchestrationV2AppThread;
   readonly request: OrchestrationV2ThreadProjection["runtimeRequests"][number] | undefined;
   readonly node: OrchestrationV2ThreadProjection["nodes"][number] | undefined;
   readonly item: OrchestrationV2ThreadProjection["turnItems"][number] | undefined;
@@ -1908,6 +1909,9 @@ export function threadShellFromProjection(
     title: projection.thread.title,
     providerInstanceId: projection.thread.providerInstanceId,
     modelSelection: projection.thread.modelSelection,
+    ...(projection.thread.threadType === undefined
+      ? {}
+      : { threadType: projection.thread.threadType }),
     runtimeMode: projection.thread.runtimeMode,
     interactionMode: projection.thread.interactionMode,
     branch: projection.thread.branch,
@@ -2222,6 +2226,9 @@ function shellFromState(input: {
     title: input.state.thread.title,
     providerInstanceId: input.state.thread.providerInstanceId,
     modelSelection: input.state.thread.modelSelection,
+    ...(input.state.thread.threadType === undefined
+      ? {}
+      : { threadType: input.state.thread.threadType }),
     runtimeMode: input.state.thread.runtimeMode,
     interactionMode: input.state.thread.interactionMode,
     branch: input.state.thread.branch,
@@ -6215,10 +6222,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       sql
         .withTransaction(
           Effect.gen(function* () {
-            yield* requireThread(threadId);
+            const thread = yield* getThread(threadId);
             const request = yield* getRuntimeRequest(threadId, requestId);
             if (request === undefined)
-              return { request, node: undefined, item: undefined, session: undefined };
+              return { thread, request, node: undefined, item: undefined, session: undefined };
             const nodeRows =
               yield* sql<PayloadRow>`SELECT payload_json FROM orchestration_v2_projection_nodes
           WHERE thread_id = ${threadId} AND node_id = ${request.nodeId}`;
@@ -6236,6 +6243,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ON binding.provider_session_id = session.provider_session_id
           WHERE binding.thread_id = ${threadId} AND session.provider_session_id = ${request.responseCapability.providerSessionId}`;
             return {
+              thread,
               request,
               node:
                 nodeRows[0] === undefined

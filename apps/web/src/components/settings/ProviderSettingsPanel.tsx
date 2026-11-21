@@ -1351,14 +1351,15 @@ function ProviderInstanceRow({
     favorite.provider === instanceId ? Result.succeed(favorite.model) : Result.failVoid,
   );
   const resetLabel = driverOption?.label ?? String(driver);
-  const projectOverride = showProjectOverride
-    ? {
-        value: projectOverrideValue,
-        effectiveEnabled: projectOverrideEffectiveEnabled,
-        onChange: (next: boolean) => actions.writeProjectOverride(instanceId, next),
-        onReset: () => actions.writeProjectOverride(instanceId, undefined),
-      }
-    : undefined;
+  const projectOverride =
+    showProjectOverride && driver !== "codexDesktopShare"
+      ? {
+          value: projectOverrideValue,
+          effectiveEnabled: projectOverrideEffectiveEnabled,
+          onChange: (next: boolean) => actions.writeProjectOverride(instanceId, next),
+          onReset: () => actions.writeProjectOverride(instanceId, undefined),
+        }
+      : undefined;
   const codexSetupMode = driver === "codex" ? readCodexSetupMode(instance.config) : null;
   const recommendedVersion = liveProvider?.compatibilityAdvisory?.recommendedVersion;
   const canInstallRecommended =

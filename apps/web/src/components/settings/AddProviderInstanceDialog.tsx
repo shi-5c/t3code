@@ -4,7 +4,7 @@ import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
 import { CheckIcon, ChevronDownIcon } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { msg, T, useGT, useMessages, Var } from "gt-react";
 import type { MessageResolver } from "../../i18n/messages";
 import {
@@ -16,6 +16,9 @@ import type { ProviderClientDefinition } from "@t3tools/provider-core/client";
 import {
   type AcpRegistrySearchAgent,
   AuthProvidersManageScope,
+  CODEX_DESKTOP_SHARE_DRIVER,
+  CODEX_DESKTOP_SHARE_INSTANCE_PREFIX,
+  isCodexDesktopShareInstance,
   ProviderInstanceId,
   ProviderDriverKind,
   type EnvironmentId,
@@ -29,7 +32,7 @@ import {
   usePersistEnvironmentProviderInstanceMutation,
 } from "../../hooks/useSettings";
 
-import { cn } from "../../lib/utils";
+import { cn, randomUUID } from "../../lib/utils";
 import { normalizeProviderAccentColor } from "../../providerInstances";
 import { managedInstanceLocks, useManagedPolicy } from "../../state/managedPolicy";
 import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
@@ -62,6 +65,7 @@ import { AcpRegistrySearchStep, useAcpRegistrySearch } from "./AcpRegistrySearch
 import { ProviderWizardAuthenticationStep } from "./ProviderWizardAuthenticationStep";
 import { resolveOfficialAcpRegistryIconUrl } from "./AcpRegistryIcon";
 import { AddManagedCodexAccountDialog } from "./CodexSetupSection";
+import { CodexDesktopShareConfirmation } from "./CodexDesktopShareConfirmation";
 import { MultipleAccountsNote } from "./MultipleAccountsNote";
 import { ProviderEnvironmentSection } from "./ProviderInstanceCard";
 import { useSecretSources } from "./SecretSourceInput";
@@ -88,6 +92,8 @@ function validateInstanceId(
       msg("Instance ID must start with a letter and use only letters, digits, '-', or '_'."),
     );
   }
+  if (isCodexDesktopShareInstance(id))
+    return resolve(msg("This instance ID is reserved for Codex Desktop Share."));
   if (existing.has(id)) return resolve(msg("An instance named ''{id}'' already exists.", { id }));
   return null;
 }
@@ -198,6 +204,8 @@ export function AddProviderInstanceDialog({
   const [configByDriver, setConfigByDriver] = useState<Record<string, Record<string, unknown>>>({});
   const [hasAttemptedSubmit, setHasAttemptedSubmit] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [confirmShareAdd, setConfirmShareAdd] = useState(false);
+  const addButton = useRef<HTMLButtonElement>(null);
   const [createdInstanceId, setCreatedInstanceId] = useState<ProviderInstanceId | null>(null);
 
   // Reserve Codex/Claude default ids because they run before configuration; other unconfigured slots are
@@ -210,6 +218,8 @@ export function AddProviderInstanceDialog({
 
   const driverOption = providerClients.get(driver) ?? DEFAULT_DRIVER_OPTION;
   const isAcpRegistry = driver === ACP_REGISTRY_DRIVER_KIND;
+  const isDesktopShare = driver === CODEX_DESKTOP_SHARE_DRIVER;
+  const lastStep = isAcpRegistry || isDesktopShare ? 1 : 2;
   const showRegistrySearch =
     !createdInstanceId &&
     !addingChatGptAccount &&
@@ -237,7 +247,7 @@ export function AddProviderInstanceDialog({
       existingIds,
     );
   const driverSettingsFields = deriveProviderSettingsFields(driverOption, undefined, m);
-  const instanceIdError = validateInstanceId(instanceId, existingIds, m);
+  const instanceIdError = isDesktopShare ? null : validateInstanceId(instanceId, existingIds, m);
   const showInstanceIdError = hasAttemptedSubmit && instanceIdError !== null;
   const identityStep = 1;
   const previewLabel = label.trim() || gt("{provider} Workspace", { provider: driverOption.label });
@@ -308,7 +318,7 @@ export function AddProviderInstanceDialog({
               instanceIdError,
               selectionError: acpSelectionError,
             })
-        : resolveWizardNavigation(wizardStep, requestedStep, ADD_PROVIDER_WIZARD_STEPS.length, {
+        : resolveWizardNavigation(wizardStep, requestedStep, lastStep + 1, {
             instanceIdError,
           }),
     );
@@ -382,11 +392,15 @@ export function AddProviderInstanceDialog({
   // A policy that owns this driver's launch settings also rules out ChatGPT's own runtime.
   const driverLocks = managedInstanceLocks(managedPolicy, driver, m);
 
-  const handleSave = async () => {
+  const handleSave = async (shareConfirmed = false) => {
     if (!readEnvironmentScope(environmentId, AuthProvidersManageScope)) return;
     if (isSaving || createdInstanceId) return;
     setHasAttemptedSubmit(true);
     if (instanceIdError !== null || (isAcpRegistry && acpSelectionError !== null)) return;
+    if (isDesktopShare && !shareConfirmed) {
+      setConfirmShareAdd(true);
+      return;
+    }
 
     const config =
       driver === "codex"
@@ -397,13 +411,15 @@ export function AddProviderInstanceDialog({
 
     const nextInstance: ProviderInstanceConfig = {
       driver,
-      enabled: true,
+      enabled: !isDesktopShare,
       ...(label.trim().length > 0 ? { displayName: label.trim() } : {}),
       ...(normalizedAccentColor ? { accentColor: normalizedAccentColor } : {}),
       ...(hasConfig ? { config } : {}),
       ...(isLocalAcp && localEnvironment.length > 0 ? { environment: localEnvironment } : {}),
     };
-    const brandedId = ProviderInstanceId.make(instanceId);
+    const brandedId = ProviderInstanceId.make(
+      isDesktopShare ? `${CODEX_DESKTOP_SHARE_INSTANCE_PREFIX}${randomUUID()}` : instanceId,
+    );
     setIsSaving(true);
     const result = await persistProviderInstance({
       operation: "create",
@@ -435,7 +451,7 @@ export function AddProviderInstanceDialog({
       title: gt("Provider instance added"),
       description: gt("{provider} instance ''{instanceId}'' was added.", {
         provider: driverOption.label,
-        instanceId,
+        instanceId: brandedId,
       }),
     });
     onOpenChange(false);
@@ -451,7 +467,7 @@ export function AddProviderInstanceDialog({
     );
   }
 
-  return (
+  const wizard = (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <WizardPopup size="wide">
         <WizardHeader
@@ -475,6 +491,7 @@ export function AddProviderInstanceDialog({
             />
           ) : (
             <AddProviderInstanceWizardSteps
+              steps={isDesktopShare ? LOCAL_ACP_WIZARD_STEPS : ADD_PROVIDER_WIZARD_STEPS}
               currentStep={wizardStep}
               summaries={wizardStepSummaries}
               instanceIdError={instanceIdError}
@@ -678,47 +695,49 @@ export function AddProviderInstanceDialog({
                     />
                   }
                 />
-                <SettingsRow
-                  title={
-                    <label htmlFor="add-provider-instance-id">
-                      <T>Instance ID</T>
-                    </label>
-                  }
-                  description={
-                    <span id="add-provider-instance-id-description">
-                      <T>Letters, digits, '-', or '_'.</T>
-                    </span>
-                  }
-                  status={
-                    showInstanceIdError ? (
-                      <span
-                        id="add-provider-instance-id-error"
-                        role="alert"
-                        className="text-destructive"
-                      >
-                        {instanceIdError}
+                {!isDesktopShare ? (
+                  <SettingsRow
+                    title={
+                      <label htmlFor="add-provider-instance-id">
+                        <T>Instance ID</T>
+                      </label>
+                    }
+                    description={
+                      <span id="add-provider-instance-id-description">
+                        <T>Letters, digits, '-', or '_'.</T>
                       </span>
-                    ) : undefined
-                  }
-                  control={
-                    <Input
-                      id="add-provider-instance-id"
-                      aria-describedby={
-                        showInstanceIdError
-                          ? "add-provider-instance-id-description add-provider-instance-id-error"
-                          : "add-provider-instance-id-description"
-                      }
-                      size="sm"
-                      className="w-full @min-[32rem]/settings-row:w-56"
-                      placeholder={`${driver}_work`}
-                      value={instanceId}
-                      onChange={(event) => {
-                        setIdentityDraft({ instanceIdOverride: event.target.value });
-                      }}
-                      aria-invalid={showInstanceIdError}
-                    />
-                  }
-                />
+                    }
+                    status={
+                      showInstanceIdError ? (
+                        <span
+                          id="add-provider-instance-id-error"
+                          role="alert"
+                          className="text-destructive"
+                        >
+                          {instanceIdError}
+                        </span>
+                      ) : undefined
+                    }
+                    control={
+                      <Input
+                        id="add-provider-instance-id"
+                        aria-describedby={
+                          showInstanceIdError
+                            ? "add-provider-instance-id-description add-provider-instance-id-error"
+                            : "add-provider-instance-id-description"
+                        }
+                        size="sm"
+                        className="w-full @min-[32rem]/settings-row:w-56"
+                        placeholder={`${driver}_work`}
+                        value={instanceId}
+                        onChange={(event) => {
+                          setIdentityDraft({ instanceIdOverride: event.target.value });
+                        }}
+                        aria-invalid={showInstanceIdError}
+                      />
+                    }
+                  />
+                ) : null}
                 <SettingsRow
                   title={gt("Accent color")}
                   description={gt("Optional marker shown in the picker.")}
@@ -783,7 +802,7 @@ export function AddProviderInstanceDialog({
                     />
                   )}
                 </>
-              ) : wizardStep < (isAcpRegistry ? 1 : 2) ? (
+              ) : wizardStep < lastStep ? (
                 <Button
                   size="sm"
                   disabled={isPreparingRegistryAgent}
@@ -794,6 +813,7 @@ export function AddProviderInstanceDialog({
               ) : (
                 <Button
                   size="sm"
+                  ref={addButton}
                   disabled={isSaving || !canManageProviders}
                   onClick={() => void handleSave()}
                 >
@@ -809,5 +829,20 @@ export function AddProviderInstanceDialog({
         )}
       </WizardPopup>
     </Dialog>
+  );
+  return (
+    <>
+      {wizard}
+      <CodexDesktopShareConfirmation
+        action="add"
+        open={open && confirmShareAdd}
+        onOpenChange={setConfirmShareAdd}
+        finalFocus={addButton}
+        onConfirm={() => {
+          setConfirmShareAdd(false);
+          void handleSave(true);
+        }}
+      />
+    </>
   );
 }

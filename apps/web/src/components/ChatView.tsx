@@ -65,6 +65,8 @@ import { useChatShortcuts } from "./chat/useChatShortcuts";
 import { ChatBannerLane } from "./chat/ChatBannerLane";
 import * as Schema from "effect/Schema";
 import {
+  allowsDesktopShareSelection,
+  codexDesktopShareThreadOwner,
   AuthOrchestrationOperateScope,
   AuthSourceControlWriteScope,
   AuthPreviewOperateScope,
@@ -1297,7 +1299,17 @@ export default function ChatView(props: ChatViewProps) {
       ? undefined
       : providersByEnvironment.get(providerEnvironmentId)) ?? EMPTY_PROVIDERS,
     gitCwd,
+  ).filter((provider) => allowsDesktopShareSelection(serverThread, provider.instanceId));
+  const desktopShareOwner =
+    serverThread === null ? null : codexDesktopShareThreadOwner(serverThread);
+  const desktopShareStatus = providerStatuses.find(
+    (provider) => provider.instanceId === desktopShareOwner,
   );
+  const desktopShareUnavailable =
+    desktopShareOwner !== null &&
+    (!desktopShareStatus ||
+      !desktopShareStatus.enabled ||
+      desktopShareStatus.availability === "unavailable");
   const composerModelSelectionApplies = draftModelSelectionApplies(
     { modelSelectionExplicit: composerModelSelectionExplicit },
     threadHasStarted(activeThread),
@@ -3752,7 +3764,12 @@ export default function ChatView(props: ChatViewProps) {
                                             ? gt("Messages loading")
                                             : worktreeSetupBlocksSend
                                               ? gt("Preparing worktree")
-                                              : projectCloneSendBlockReason
+                                              : desktopShareUnavailable
+                                                ? (desktopShareStatus?.unavailableReason ??
+                                                  gt(
+                                                    "Check the Codex Desktop Share connection on its host.",
+                                                  ))
+                                                : projectCloneSendBlockReason
                                 }
                                 isPreparingWorktree={isPreparingWorktree && !sendQueuesBehindSetup}
                                 bannerItems={

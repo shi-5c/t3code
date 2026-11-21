@@ -14,6 +14,9 @@ import type {
   ServerConfig as T3ServerConfig,
 } from "@t3tools/contracts";
 import {
+  allowsDesktopShareSelection,
+  CODEX_DESKTOP_SHARE_DRIVER,
+  isCodexDesktopShareInstance,
   isManagedDriverAllowed,
   isProviderDriverKind,
   resolveProjectProviderInstanceEnabled,
@@ -184,6 +187,17 @@ export function serverConfigForCwd<C extends T3ServerConfig | null | undefined>(
   return providers === config.providers ? config : { ...config, providers };
 }
 
+export function serverConfigForThreadProviders<C extends T3ServerConfig | null | undefined>(
+  config: C,
+  thread: Parameters<typeof allowsDesktopShareSelection>[0],
+): C {
+  if (!config || thread === null) return config;
+  const providers = config.providers.filter((provider) =>
+    allowsDesktopShareSelection(thread, provider.instanceId),
+  );
+  return providers.length === config.providers.length ? config : { ...config, providers };
+}
+
 /** Require explicit projectId or null so omissions cannot bypass project provider disablement. */
 export function isModelSelectionUnavailable(
   config: T3ServerConfig | null | undefined,
@@ -196,6 +210,9 @@ export function isModelSelectionUnavailable(
   const provider = config.providers.find(
     (candidate) => candidate.instanceId === selection.instanceId,
   );
+  if (isCodexDesktopShareInstance(selection.instanceId)) {
+    return !provider || provider.availability === "unavailable" || !provider.enabled;
+  }
   if (isDisabledForProject(config, provider, selection.instanceId, projectId)) {
     return true;
   }
@@ -238,6 +255,14 @@ export function describeUnavailableModelSelection(
           message: disallowedProviderText(config?.managedPolicy?.organization, label),
         }),
       ),
+    };
+  }
+  if (isCodexDesktopShareInstance(selection.instanceId)) {
+    return {
+      title: m(msg("Codex Desktop Share is unavailable")),
+      detail:
+        provider?.unavailableReason ??
+        m(msg("Check the shared connection in provider settings on the T3 host.")),
     };
   }
   return isDisabledForProject(config, provider, selection.instanceId, projectId)
@@ -392,7 +417,8 @@ export function buildModelOptions(
       !isProviderEnabledForProject(config, provider, projectId) ||
       !provider.installed ||
       provider.auth.status === "unauthenticated" ||
-      (provider.driver === "antigravity" && provider.availability === "unavailable")
+      ((provider.driver === "antigravity" || provider.driver === CODEX_DESKTOP_SHARE_DRIVER) &&
+        provider.availability === "unavailable")
     ) {
       continue;
     }

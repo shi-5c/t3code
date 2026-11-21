@@ -2,6 +2,7 @@ import { EnvironmentId, ProviderDriverKind, type AcpRegistrySearchAgent } from "
 import { userEvent } from "vite-plus/test/browser";
 import { describe, expect, it, vi } from "vite-plus/test";
 
+import "~/index.css";
 import { act, render } from "../../../test/render";
 
 const actions = vi.hoisted(() => ({
@@ -149,6 +150,34 @@ function setup() {
 }
 
 describe("AddProviderInstanceDialog environment routing", () => {
+  it("adds Desktop Share disabled only after confirmation", async () => {
+    setup();
+    await using screen = await render(dialog());
+    await screen.getByRole("radio", { name: "Codex Desktop Share" }).click();
+    await screen.getByRole("button", { name: "Next", exact: true }).click();
+    await screen.getByRole("button", { name: "Add instance", exact: true }).click();
+
+    const confirmation = screen.getByRole("alertdialog", { name: "Add Codex Desktop Share?" });
+    await expect.element(confirmation.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    await confirmation.getByRole("button", { name: "Cancel" }).click();
+    expect(settingsHooks.mutate).not.toHaveBeenCalled();
+    await expect
+      .element(screen.getByRole("button", { name: "Add instance", exact: true }))
+      .toHaveFocus();
+
+    await screen.getByRole("button", { name: "Add instance", exact: true }).click();
+    await confirmation.getByRole("button", { name: "Add", exact: true }).click();
+    expect(settingsHooks.mutate).toHaveBeenCalledExactlyOnceWith({
+      operation: "create",
+      instanceId: expect.stringMatching(/^codexDesktopShare_/),
+      instance: {
+        driver: "codexDesktopShare",
+        displayName: "Codex Desktop Share",
+        enabled: false,
+      },
+    });
+  });
+
   it("chooses an unused identity for another account without replacing configured instances", async () => {
     setup();
     settingsHooks.read.mockReturnValue({

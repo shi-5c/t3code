@@ -1620,9 +1620,17 @@ export const providerInstanceConfigEnabledFlag = (config: unknown): boolean | un
 
 // Must match each driver's enabled decoding default.
 const DEFAULT_DISABLED_PROVIDER_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set(
-  ["cursor", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"].map((driver) =>
-    ProviderDriverKind.make(driver),
-  ),
+  [
+    "cursor",
+    "grok",
+    "fx",
+    "kiro",
+    "muse",
+    "pi",
+    "opencode",
+    "antigravity",
+    "codexDesktopShare",
+  ].map((driver) => ProviderDriverKind.make(driver)),
 );
 
 const DEFAULT_ENABLED_DEFAULT_INSTANCES: ReadonlySet<ProviderInstanceId> = new Set(
@@ -1654,10 +1662,10 @@ export const resolveProjectProviderInstanceEnabled = (
     projectId === null
       ? undefined
       : settings.projectSettingsOverrides[projectId]?.providerInstances?.[instanceId]?.enabled;
-  if (override !== undefined) return override;
   const instanceConfig = Object.hasOwn(settings.providerInstances, instanceId)
     ? settings.providerInstances[instanceId]
     : undefined;
+  if (override !== undefined && instanceConfig?.driver !== "codexDesktopShare") return override;
   return instanceConfig !== undefined
     ? resolveProviderInstanceEnabled(instanceConfig)
     : isUnconfiguredDefaultInstanceEnabled(instanceId);
@@ -1746,6 +1754,8 @@ export const ServerSettingsOperation = Schema.Literals([
   "write-secret",
   "write-secret-provider",
   "write-file",
+  "configure-codex-desktop-share",
+  "enable-codex-desktop-share",
   "prepare-directory",
   "write-managed-setting",
   "use-disallowed-provider",
@@ -1772,6 +1782,12 @@ export class ServerSettingsError extends Schema.TaggedError<ServerSettingsError>
   },
 ) {
   override get message(): string {
+    if (this.operation === "enable-codex-desktop-share") {
+      return "This T3 build requires a verified Codex Desktop shared connection before enabling it.";
+    }
+    if (this.operation === "configure-codex-desktop-share") {
+      return "Codex Desktop Share requires its own instance ID and uses host-managed configuration.";
+    }
     if (this.operation === "write-managed-setting") {
       return `${this.managedSetting ?? "This setting"} is managed by ${this.managedBy ?? "your organization"} and cannot be changed.`;
     }

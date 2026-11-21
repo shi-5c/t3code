@@ -22,6 +22,36 @@ export const isProviderDriverKind = Schema.is(ProviderDriverKind);
 export const ProviderInstanceId = slugSchema.pipe(Schema.brand("ProviderInstanceId"));
 export type ProviderInstanceId = typeof ProviderInstanceId.Type;
 
+export const CODEX_DESKTOP_SHARE_DRIVER = ProviderDriverKind.make("codexDesktopShare");
+export const CODEX_DESKTOP_SHARE_INSTANCE_PREFIX = "codexDesktopShare_";
+export const CodexDesktopShareSettings = Schema.Struct({});
+
+export function isCodexDesktopShareInstance(instanceId: string | undefined): boolean {
+  return instanceId?.startsWith(CODEX_DESKTOP_SHARE_INSTANCE_PREFIX) === true;
+}
+
+export function codexDesktopShareThreadOwner(thread: {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly threadType?: "t3" | "codex-shared" | undefined;
+}): ProviderInstanceId | null {
+  if (
+    isCodexDesktopShareInstance(thread.providerInstanceId) ||
+    thread.threadType === "codex-shared"
+  ) {
+    return thread.providerInstanceId;
+  }
+  return null;
+}
+
+export function allowsDesktopShareSelection(
+  thread: Parameters<typeof codexDesktopShareThreadOwner>[0] | null,
+  target: ProviderInstanceId,
+): boolean {
+  if (thread === null) return true;
+  const owner = codexDesktopShareThreadOwner(thread);
+  return owner === null ? !isCodexDesktopShareInstance(target) : owner === target;
+}
+
 export const ProviderInstanceEnvironmentVariableName = TrimmedNonEmptyString.check(
   Schema.isMaxLength(ENVIRONMENT_VARIABLE_NAME_MAX_CHARS),
   Schema.isPattern(ENVIRONMENT_VARIABLE_NAME_PATTERN),

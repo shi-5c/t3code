@@ -68,6 +68,7 @@ import {
   buildModelOptions,
   groupByProvider,
   serverConfigForCwd,
+  serverConfigForThreadProviders,
   type ModelOption,
   type ProviderGroup,
   withStoredThreadModelOptions,
@@ -293,6 +294,7 @@ type ThreadSettingsSessionProps = {
   readonly cwd: string | null;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly lockedProviderInstanceId?: ProviderInstanceId;
+  readonly existingThread?: NonNullable<Parameters<typeof serverConfigForThreadProviders>[1]>;
   readonly providerGroups: ReadonlyArray<ProviderGroup>;
   readonly selectedModel: ModelSelection | null;
   readonly prompt: string;
@@ -376,7 +378,10 @@ function ThreadSettingsSessionProvider(
     manageHidden && config
       ? groupByProvider(
           buildModelOptions(
-            serverConfigForCwd(config, props.cwd),
+            serverConfigForThreadProviders(
+              serverConfigForCwd(config, props.cwd),
+              props.existingThread ?? null,
+            ),
             props.selectedModel,
             props.lockedProviderInstanceId,
             props.projectId,
@@ -1527,7 +1532,7 @@ export function ExistingThreadSettingsRouteScreen({
     ? undefined
     : modelSelection.instanceId;
   const modelOptions = buildModelOptions(
-    serverConfig,
+    serverConfigForThreadProviders(serverConfig, selectedThread),
     modelSelection,
     lockedProviderInstanceId,
     selectedThread.projectId,
@@ -1547,6 +1552,7 @@ export function ExistingThreadSettingsRouteScreen({
       projectId={selectedThread.projectId}
       cwd={selectedThreadCwd}
       providerInstanceId={modelSelection.instanceId}
+      existingThread={selectedThread}
       {...(lockedProviderInstanceId ? { lockedProviderInstanceId } : {})}
       providerGroups={groupByProvider(modelOptions)}
       selectedModel={modelSelection}

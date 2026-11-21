@@ -1,4 +1,4 @@
-import type { OrchestrationV2ThreadProjection } from "@t3tools/contracts";
+import { ProviderInstanceId, type OrchestrationV2ThreadProjection } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { threadAllowsProviderSwitch } from "./thread-provider-switching";
@@ -27,6 +27,20 @@ function projectionWithSession(supportsProviderSwitchingViaHandoff: boolean) {
 }
 
 describe("threadAllowsProviderSwitch", () => {
+  it("keeps a Desktop Share thread bound before its first run and while offline", () => {
+    expect(
+      threadAllowsProviderSwitch({
+        thread: {
+          providerInstanceId: ProviderInstanceId.make("codexDesktopShare_test"),
+          latestRun: null,
+          latestUserMessageAt: null,
+          runtime: null,
+        },
+        projection: null,
+      }),
+    ).toBe(false);
+  });
+
   it("keeps a started thread on its provider when the session cannot hand off", () => {
     expect(
       threadAllowsProviderSwitch({

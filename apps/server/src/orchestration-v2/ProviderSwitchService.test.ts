@@ -342,3 +342,42 @@ it.effect(
       ),
     ),
 );
+
+const desktopShare = ProviderInstanceId.make("codexDesktopShare_a");
+const otherDesktopShare = ProviderInstanceId.make("codexDesktopShare_b");
+
+it.effect.each([
+  [currentInstanceId, desktopShare],
+  [desktopShare, currentInstanceId],
+  [desktopShare, otherDesktopShare],
+] as const)(
+  "refuses to switch a new thread across Desktop Share ownership (%j)",
+  ([source, target]) =>
+    Effect.gen(function* () {
+      const service = yield* ProviderSwitch.ProviderSwitchServiceV2;
+      const base = projection();
+      const result = yield* Effect.result(
+        service.plan({
+          projection: {
+            ...base,
+            thread: {
+              ...base.thread,
+              providerInstanceId: source,
+              modelSelection: { ...base.thread.modelSelection, instanceId: source },
+            },
+            providerSessions: [],
+          },
+          targetModelSelection: { instanceId: target, model: "gpt-5.1-codex" },
+        }),
+      );
+      assert.equal(result._tag, "Failure");
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          [currentInstanceId]: { continuationKey: "codex:ordinary" },
+          [desktopShare]: { continuationKey: "codex:desktop-share-a" },
+          [otherDesktopShare]: { continuationKey: "codex:desktop-share-b" },
+        }),
+      ),
+    ),
+);

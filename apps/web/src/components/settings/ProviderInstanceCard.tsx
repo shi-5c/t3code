@@ -19,6 +19,7 @@ import * as Result from "effect/Result";
 import { Fragment, useState, type ReactElement, type ReactNode } from "react";
 import { T, useGT, useMessages, Var } from "gt-react";
 import {
+  CODEX_DESKTOP_SHARE_DRIVER,
   isProviderDriverKind,
   resolveProviderInstanceEnabled,
   type ProviderInstanceConfig,
@@ -63,6 +64,7 @@ import {
   reconcileRowsDraft,
   seedRowsDraft,
 } from "./ProviderSettingsForm";
+import { CodexDesktopShareConfirmation } from "./CodexDesktopShareConfirmation";
 import { ProviderModelsSection } from "./ProviderModelsSection";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 import { ProviderAccentColorPicker } from "./ProviderAccentColorPicker";
@@ -810,6 +812,15 @@ export function ProviderInstanceCard({
 }: ProviderInstanceCardProps) {
   const gt = useGT();
   const m = useMessages();
+  const isDesktopShare = instance.driver === CODEX_DESKTOP_SHARE_DRIVER;
+  const [confirmShareEnable, setConfirmShareEnable] = useState(false);
+  const shareUnavailableReason =
+    liveProvider?.availability === "unavailable"
+      ? (liveProvider.unavailableReason ??
+        gt("A verified shared connection is required on this host."))
+      : liveProvider === undefined
+        ? gt("Waiting for Codex Desktop preflight on this host.")
+        : undefined;
   const enabled = projectOverride?.effectiveEnabled ?? resolveProviderInstanceEnabled(instance);
   const effectiveProvider = liveProvider && { ...liveProvider, enabled };
   const compatibility = enabled ? liveProvider?.compatibilityAdvisory : undefined;
@@ -921,6 +932,10 @@ export function ProviderInstanceCard({
   };
 
   const updateEnabled = (value: boolean) => {
+    if (isDesktopShare && value) {
+      setConfirmShareEnable(true);
+      return;
+    }
     if (projectOverride) {
       projectOverride.onChange(value);
       return;
@@ -1170,6 +1185,19 @@ export function ProviderInstanceCard({
     </Popover>
   ) : null;
 
+  const shareConfirmation = isDesktopShare ? (
+    <CodexDesktopShareConfirmation
+      action="enable"
+      open={confirmShareEnable}
+      unavailableReason={shareUnavailableReason}
+      onOpenChange={setConfirmShareEnable}
+      onConfirm={() => {
+        setConfirmShareEnable(false);
+        onUpdate({ ...instance, enabled: true });
+      }}
+    />
+  ) : null;
+
   if (mode === "list") {
     return (
       <div
@@ -1234,7 +1262,9 @@ export function ProviderInstanceCard({
                 deviceEnabled={resolveProviderInstanceEnabled(instance)}
               />
               <SettingResetButton
-                ariaLabel={gt("Reset {provider} enablement to default", { provider: displayName })}
+                ariaLabel={gt("Reset {provider} enablement to default", {
+                  provider: displayName,
+                })}
                 tooltip={gt("Reset to the device setting")}
                 disabled={readOnly || !canWriteSettings}
                 onClick={projectOverride.onReset}
@@ -1251,6 +1281,7 @@ export function ProviderInstanceCard({
             />
           </ManagedControl>
         </span>
+        {shareConfirmation}
       </div>
     );
   }
@@ -1360,6 +1391,22 @@ export function ProviderInstanceCard({
     <>
       <SettingsSection title={displayName} icon={titleIconNode} headerAction={editorHeaderAction}>
         <SettingsRow title={gt("Status")} status={statusContent} />
+        {isDesktopShare ? (
+          <SettingsRow
+            title={gt("Desktop on this host")}
+            description={shareUnavailableReason}
+            control={
+              <Switch
+                checked={enabled}
+                disabled={
+                  readOnly || !canWriteSettings || (!enabled && managedDriverReason !== undefined)
+                }
+                onCheckedChange={(checked) => updateEnabled(Boolean(checked))}
+                aria-label={gt("Enable {provider}", { provider: displayName })}
+              />
+            }
+          />
+        ) : null}
         <SettingsRow
           title={gt("Display name")}
           control={
@@ -1450,30 +1497,33 @@ export function ProviderInstanceCard({
         </SettingsSection>
       ) : null}
 
-      <SettingsSection
-        title={gt("Environment")}
-        inert={readOnly || instanceLocks?.wholeEnvironment}
-        aria-disabled={readOnly || instanceLocks?.wholeEnvironment || undefined}
-        className={readOnly ? "opacity-50 select-none" : undefined}
-      >
-        {instanceLocks?.wholeEnvironment ? (
-          <ManagedNotice>{instanceLocks.reason}</ManagedNotice>
-        ) : null}
-        <div className={instanceLocks?.wholeEnvironment ? "opacity-50" : undefined}>
-          <ProviderEnvironmentSection
-            environment={genericEnvironment}
-            onChange={updateGenericEnvironment}
-            secretSources={secretSources}
-            environmentId={environmentId}
-            managed={
-              instanceLocks && {
-                names: instanceLocks.environmentNames,
-                reason: instanceLocks.reason,
+      {shareConfirmation}
+      {!isDesktopShare ? (
+        <SettingsSection
+          title={gt("Environment")}
+          inert={readOnly || instanceLocks?.wholeEnvironment}
+          aria-disabled={readOnly || instanceLocks?.wholeEnvironment || undefined}
+          className={readOnly ? "opacity-50 select-none" : undefined}
+        >
+          {instanceLocks?.wholeEnvironment ? (
+            <ManagedNotice>{instanceLocks.reason}</ManagedNotice>
+          ) : null}
+          <div className={instanceLocks?.wholeEnvironment ? "opacity-50" : undefined}>
+            <ProviderEnvironmentSection
+              environment={genericEnvironment}
+              onChange={updateGenericEnvironment}
+              secretSources={secretSources}
+              environmentId={environmentId}
+              managed={
+                instanceLocks && {
+                  names: instanceLocks.environmentNames,
+                  reason: instanceLocks.reason,
+                }
               }
-            }
-          />
-        </div>
-      </SettingsSection>
+            />
+          </div>
+        </SettingsSection>
+      ) : null}
       {environmentId !== undefined && liveProvider?.driver === "acpRegistry" ? (
         <AcpSessionManagementSection
           environmentId={environmentId}

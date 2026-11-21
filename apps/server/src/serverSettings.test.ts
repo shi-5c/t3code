@@ -556,6 +556,41 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings"
     }).pipe(Effect.provide(layerServerSettings())),
   );
 
+  it.effect(
+    "stores Desktop Share disabled and rejects activation or repurposing through settings",
+    () =>
+      Effect.gen(function* () {
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const instanceId = ProviderInstanceId.make("codexDesktopShare_test");
+        const driver = ProviderDriverKind.make("codexDesktopShare");
+        yield* service.updateProviderInstance({
+          operation: "create",
+          instanceId,
+          instance: { driver, enabled: false },
+        });
+
+        const enable = yield* Effect.flip(
+          service.updateSettings({
+            providerInstances: { [instanceId]: { driver, enabled: true } },
+          }),
+        );
+        assert.equal(enable.operation, "enable-codex-desktop-share");
+
+        const replace = yield* Effect.flip(
+          service.updateProviderInstance({
+            operation: "upsert",
+            instanceId,
+            instance: { driver: ProviderDriverKind.make("codex"), enabled: true },
+          }),
+        );
+        assert.equal(replace.operation, "configure-codex-desktop-share");
+        assert.deepEqual((yield* service.getSettings).providerInstances[instanceId], {
+          driver,
+          enabled: false,
+        });
+      }).pipe(Effect.provide(layerServerSettings())),
+  );
+
   it.effect("pauses provider-instance mutations while a settings snapshot is in use", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
