@@ -68,7 +68,7 @@ const preflight = Effect.fn("CodexDesktopShareDriver.preflight")(function* () {
   if (!version) return "The Codex Desktop Windows package was not found for the T3 host user.";
   if (!hasCli) return `Codex Desktop ${version} has an unrecognized CLI layout.`;
   if (hasOverride) return `Codex Desktop ${version} has an existing CODEX_CLI_PATH override.`;
-  return `Codex Desktop ${version} has no verified shared connection with per-thread authorization and revocation.`;
+  return `Codex Desktop ${version} has no verified shared-session runtime.`;
 });
 
 export const CodexDesktopShareDriver: ProviderDriver<
