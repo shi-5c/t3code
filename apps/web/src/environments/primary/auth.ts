@@ -8,7 +8,7 @@ import type {
   AuthSessionId,
   AuthSessionState,
 } from "@t3tools/contracts";
-import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
+import { EnvironmentHttpCommonError } from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -20,6 +20,7 @@ import {
 } from "@t3tools/shared/remote";
 
 import { PrimaryEnvironmentHttpClient } from "./httpClient";
+import { invalidateDesktopPrimaryBearerToken } from "./desktopAuth";
 import { runPrimaryHttp } from "../../lib/runtime";
 import { msg } from "gt-react";
 import { m } from "../../i18n/messages";
@@ -171,15 +172,6 @@ export function takePairingTokenFromUrl(): string | null {
   return token;
 }
 
-function getDesktopBootstrapCredential(): string | null {
-  // DesktopBackendConfiguration gives primary and WSL the same bootstrap token.
-  const bootstraps = window.desktopBridge?.getLocalEnvironmentBootstraps() ?? [];
-  const primary = bootstraps.find((entry) => entry.id === PRIMARY_LOCAL_ENVIRONMENT_ID);
-  return typeof primary?.bootstrapToken === "string" && primary.bootstrapToken.length > 0
-    ? primary.bootstrapToken
-    : null;
-}
-
 export async function fetchSessionState(): Promise<AuthSessionState> {
   return retryTransientBootstrap(async () => {
     try {
@@ -322,8 +314,7 @@ async function bootstrapServerAuth(urlCredential: string | null): Promise<Server
     return { status: "authenticated" };
   }
 
-  const bootstrapCredential = urlCredential ?? getDesktopBootstrapCredential();
-  if (!bootstrapCredential) {
+  if (!urlCredential && !window.desktopBridge) {
     return {
       status: "requires-auth",
       auth: currentSession.auth,
@@ -331,8 +322,14 @@ async function bootstrapServerAuth(urlCredential: string | null): Promise<Server
   }
 
   try {
-    await exchangeBootstrapCredential(bootstrapCredential);
-    await waitForAuthenticatedSessionAfterBootstrap();
+    if (urlCredential) {
+      await exchangeBootstrapCredential(urlCredential);
+      await waitForAuthenticatedSessionAfterBootstrap();
+    } else {
+      invalidateDesktopPrimaryBearerToken();
+      const refreshed = await fetchSessionState();
+      if (!refreshed.authenticated) return { status: "requires-auth", auth: refreshed.auth };
+    }
     return { status: "authenticated" };
   } catch (error) {
     return {

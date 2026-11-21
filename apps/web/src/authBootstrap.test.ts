@@ -135,7 +135,7 @@ describe("resolveInitialServerAuthGateState", () => {
     vi.restoreAllMocks();
   });
 
-  it("reuses an in-flight silent bootstrap attempt", async () => {
+  it("shares recovery of an invalid desktop bearer without creating a browser cookie", async () => {
     const nextSession = sequence(
       unauthenticatedSession(DESKTOP_AUTH),
       authenticatedSession(DESKTOP_AUTH),
@@ -160,10 +160,14 @@ describe("resolveInitialServerAuthGateState", () => {
 
     const { resolveInitialServerAuthGateState } = await import("./environments/primary");
 
-    await Promise.all([resolveInitialServerAuthGateState(), resolveInitialServerAuthGateState()]);
+    const gates = await Promise.all([
+      resolveInitialServerAuthGateState(),
+      resolveInitialServerAuthGateState(),
+    ]);
 
+    expect(gates).toEqual([{ status: "authenticated" }, { status: "authenticated" }]);
     expect(testApi.calls.session).toBe(2);
-    expect(testApi.calls.browserSession).toEqual([{ credential: "desktop-bootstrap-token" }]);
+    expect(testApi.calls.browserSession).toEqual([]);
   });
 
   it("retries the desktop bootstrap while the backend is still unreachable", async () => {
@@ -211,7 +215,7 @@ describe("resolveInitialServerAuthGateState", () => {
       expect(resolveInitialServerAuthGateState()).resolves.toEqual({ status: "authenticated" }),
       vi.advanceTimersByTimeAsync(1_000),
     ]);
-    expect(testApi.calls.browserSession).toEqual([{ credential: "desktop-bootstrap-token" }]);
+    expect(testApi.calls.browserSession).toEqual([]);
   });
 
   it("takes a pairing token from the location hash and strips it immediately", async () => {

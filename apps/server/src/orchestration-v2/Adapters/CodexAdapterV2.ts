@@ -4961,8 +4961,35 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             readonly request: OrchestrationV2RuntimeRequest;
             readonly turnItem: OrchestrationV2TurnItem;
           },
+          pending: PendingCodexRuntimeRequest,
         ) =>
-          Deferred.await(response).pipe(
+          Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              yield* Ref.update(pendingRuntimeRequests, (current) => {
+                const updated = new Map(current);
+                updated.set(String(artifacts.request.id), pending);
+                return updated;
+              });
+              yield* emitProviderEvent({
+                type: "node.updated",
+                driver: providerDriver,
+                node: artifacts.node,
+              });
+              yield* emitProviderEvent({
+                type: "turn_item.updated",
+                driver: providerDriver,
+                turnItem: artifacts.turnItem,
+              });
+              yield* emitProviderEvent({
+                type: "runtime_request.updated",
+                driver: providerDriver,
+                threadId: artifacts.node.threadId,
+                runtimeRequest: artifacts.request,
+              });
+              // A native decision can arrive as soon as the request is visible.
+              return yield* restore(Deferred.await(response));
+            }),
+          ).pipe(
             Effect.onInterrupt(() =>
               sharedDesktop
                 ? Effect.gen(function* () {
@@ -6057,33 +6084,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : { prompt: payload.reason ?? payload.command }),
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
-            yield* Ref.update(pendingRuntimeRequests, (current) => {
-              const updated = new Map(current);
-              updated.set(String(artifacts.request.id), {
-                type: "approval",
-                requestKind: "command",
-                decision,
-              });
-              return updated;
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts, {
+              type: "approval",
+              requestKind: "command",
+              decision,
             });
-            yield* emitProviderEvent({
-              type: "node.updated",
-              driver: providerDriver,
-              node: artifacts.node,
-            });
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: providerDriver,
-              turnItem: artifacts.turnItem,
-            });
-            yield* emitProviderEvent({
-              type: "runtime_request.updated",
-              driver: providerDriver,
-              threadId: artifacts.node.threadId,
-              runtimeRequest: artifacts.request,
-            });
-
-            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             if (resolved === "acceptForSession" || resolved === "acceptAlways") {
               allowance.add("command");
             }
@@ -6121,33 +6126,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }) ?? null,
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
-            yield* Ref.update(pendingRuntimeRequests, (current) => {
-              const updated = new Map(current);
-              updated.set(String(artifacts.request.id), {
-                type: "approval",
-                requestKind: "file-change",
-                decision,
-              });
-              return updated;
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts, {
+              type: "approval",
+              requestKind: "file-change",
+              decision,
             });
-            yield* emitProviderEvent({
-              type: "node.updated",
-              driver: providerDriver,
-              node: artifacts.node,
-            });
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: providerDriver,
-              turnItem: artifacts.turnItem,
-            });
-            yield* emitProviderEvent({
-              type: "runtime_request.updated",
-              driver: providerDriver,
-              threadId: artifacts.node.threadId,
-              runtimeRequest: artifacts.request,
-            });
-
-            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             if (resolved === "acceptForSession" || resolved === "acceptAlways") {
               allowance.add("file-change");
             }
@@ -6176,33 +6159,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ...(payload.reason === undefined ? {} : { prompt: payload.reason }),
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
-            yield* Ref.update(pendingRuntimeRequests, (current) => {
-              const updated = new Map(current);
-              updated.set(String(artifacts.request.id), {
-                type: "approval",
-                requestKind,
-                decision,
-              });
-              return updated;
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts, {
+              type: "approval",
+              requestKind,
+              decision,
             });
-            yield* emitProviderEvent({
-              type: "node.updated",
-              driver: providerDriver,
-              node: artifacts.node,
-            });
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: providerDriver,
-              turnItem: artifacts.turnItem,
-            });
-            yield* emitProviderEvent({
-              type: "runtime_request.updated",
-              driver: providerDriver,
-              threadId: artifacts.node.threadId,
-              runtimeRequest: artifacts.request,
-            });
-
-            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             return permissionsResponseFromDecision({
               decision: resolved,
               permissions: payload.permissions,
@@ -6255,33 +6216,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               options: described.options,
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
-            yield* Ref.update(pendingRuntimeRequests, (current) => {
-              const updated = new Map(current);
-              updated.set(String(artifacts.request.id), {
-                type: "approval",
-                requestKind: "mcp-elicitation",
-                decision,
-              });
-              return updated;
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts, {
+              type: "approval",
+              requestKind: "mcp-elicitation",
+              decision,
             });
-            yield* emitProviderEvent({
-              type: "node.updated",
-              driver: providerDriver,
-              node: artifacts.node,
-            });
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: providerDriver,
-              turnItem: artifacts.turnItem,
-            });
-            yield* emitProviderEvent({
-              type: "runtime_request.updated",
-              driver: providerDriver,
-              threadId: artifacts.node.threadId,
-              runtimeRequest: artifacts.request,
-            });
-
-            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             return toMcpElicitationResponse(payload, resolved);
           }).pipe(Effect.orDie),
         );
@@ -6311,33 +6250,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               prompt: payload.reason ?? payload.command.join(" "),
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
-            yield* Ref.update(pendingRuntimeRequests, (current) => {
-              const updated = new Map(current);
-              updated.set(String(artifacts.request.id), {
-                type: "approval",
-                requestKind: "command",
-                decision,
-              });
-              return updated;
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts, {
+              type: "approval",
+              requestKind: "command",
+              decision,
             });
-            yield* emitProviderEvent({
-              type: "node.updated",
-              driver: providerDriver,
-              node: artifacts.node,
-            });
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: providerDriver,
-              turnItem: artifacts.turnItem,
-            });
-            yield* emitProviderEvent({
-              type: "runtime_request.updated",
-              driver: providerDriver,
-              threadId: artifacts.node.threadId,
-              runtimeRequest: artifacts.request,
-            });
-
-            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             if (resolved === "acceptForSession" || resolved === "acceptAlways") {
               allowance.add("command");
             }
@@ -6371,33 +6288,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               prompt: codexFileChangeApprovalPrompt(payload) ?? null,
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
-            yield* Ref.update(pendingRuntimeRequests, (current) => {
-              const updated = new Map(current);
-              updated.set(String(artifacts.request.id), {
-                type: "approval",
-                requestKind: "file-change",
-                decision,
-              });
-              return updated;
+            const resolved = yield* awaitRuntimeResponse(decision, artifacts, {
+              type: "approval",
+              requestKind: "file-change",
+              decision,
             });
-            yield* emitProviderEvent({
-              type: "node.updated",
-              driver: providerDriver,
-              node: artifacts.node,
-            });
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: providerDriver,
-              turnItem: artifacts.turnItem,
-            });
-            yield* emitProviderEvent({
-              type: "runtime_request.updated",
-              driver: providerDriver,
-              threadId: artifacts.node.threadId,
-              runtimeRequest: artifacts.request,
-            });
-
-            const resolved = yield* awaitRuntimeResponse(decision, artifacts);
             if (resolved === "acceptForSession" || resolved === "acceptAlways") {
               allowance.add("file-change");
             }
@@ -6424,32 +6319,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               questions: payload.questions,
             });
             const answers = yield* Deferred.make<ProviderUserInputAnswers, never>();
-            yield* Ref.update(pendingRuntimeRequests, (current) => {
-              const updated = new Map(current);
-              updated.set(String(artifacts.request.id), {
-                type: "user_input",
-                answers,
-              });
-              return updated;
+            const resolved = yield* awaitRuntimeResponse(answers, artifacts, {
+              type: "user_input",
+              answers,
             });
-            yield* emitProviderEvent({
-              type: "node.updated",
-              driver: providerDriver,
-              node: artifacts.node,
-            });
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: providerDriver,
-              turnItem: artifacts.turnItem,
-            });
-            yield* emitProviderEvent({
-              type: "runtime_request.updated",
-              driver: providerDriver,
-              threadId: artifacts.node.threadId,
-              runtimeRequest: artifacts.request,
-            });
-
-            const resolved = yield* awaitRuntimeResponse(answers, artifacts);
             return {
               answers: toCodexUserInputAnswers(resolved, artifacts.nativeQuestionIds),
             } satisfies CodexSchema.ToolRequestUserInputResponse;

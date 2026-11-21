@@ -9,6 +9,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
   CheckpointId,
+  CODEX_DESKTOP_SHARE_DRIVER,
   CodexSettings,
   EnvironmentId,
   MessageId,
@@ -1529,6 +1530,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     promptSuggestions: Effect.Effect<boolean> = Effect.succeed(false),
     onNotification: (method: string) => Effect.Effect<void> = () => Effect.void,
     models?: CodexAdapterV2.CodexAdapterV2Options["models"],
+    sharedDesktop?: CodexAdapterV2.CodexAdapterV2Options["sharedDesktop"],
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -1541,7 +1543,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         [];
       const commandStopWatchers: Array<PortScanner.AgentCommandStopWatcher> = [];
       const driver = yield* CodexReplay.makeReplayDriver(
-        withConfigReads(transcript),
+        sharedDesktop ? transcript : withConfigReads(transcript),
         beforeEmitInbound === undefined ? {} : { beforeEmitInbound },
       );
       const clientFactory: CodexAdapterV2.CodexAppServerClientFactoryShape = {
@@ -1593,6 +1595,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         clientFactory,
         ...(onUsageLimits ? { onUsageLimits } : {}),
         ...(models ? { models } : {}),
+        ...(sharedDesktop ? { sharedDesktop } : {}),
         digest: yield* Digest.Digest,
         fileSystem,
         idAllocator,
@@ -12229,6 +12232,159 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         ),
     );
   });
+
+  it.effect("closes a shared command approval when Codex Desktop answers it", () =>
+    Effect.gen(function* () {
+      const threadId = "desktop-thread";
+      const turnId = "desktop-turn";
+      const prompt = "Run a command.";
+      const id = 93;
+      const attemptId = RunAttemptId.make("desktop-approval");
+      const pending = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<OrchestrationV2RuntimeRequest>();
+      const preamble = codexReplayPreamble({
+        nativeThreadId: threadId,
+        nativeTurnId: turnId,
+        prompt,
+      });
+      const threadResponse = preamble[4]!;
+      assert.isTrue(threadResponse.type === "emit_inbound");
+      if (threadResponse.type !== "emit_inbound" || !Predicate.isObject(threadResponse.frame)) {
+        return yield* Effect.die("Invalid thread response fixture");
+      }
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "desktop-approval",
+          entries: [
+            ...preamble.slice(0, 3),
+            {
+              type: "expect_outbound",
+              label: "config/read",
+              frame: {
+                id: 2,
+                method: "config/read",
+                params: { cwd: "/workspace", includeLayers: false },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "config/read",
+              frame: { id: 2, result: { config: {}, origins: {} } },
+            },
+            {
+              type: "expect_outbound",
+              label: "thread/start",
+              frame: { id: 3, method: "thread/start", params: {} },
+            },
+            { ...threadResponse, frame: { ...threadResponse.frame, id: 3 } },
+            {
+              type: "expect_outbound",
+              label: "thread/read",
+              frame: { id: 4, method: "thread/read", params: { threadId, includeTurns: false } },
+            },
+            { ...threadResponse, frame: { ...threadResponse.frame, id: 4 } },
+            {
+              type: "expect_outbound",
+              label: "turn/start",
+              frame: {
+                id: 5,
+                method: "turn/start",
+                params: {
+                  threadId,
+                  clientUserMessageId: `message-${attemptId}`,
+                  input: [{ type: "text", text: prompt }],
+                  model: "gpt-5.4",
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "turn/start",
+              frame: {
+                id: 5,
+                result: { turn: makeCodexReplayTurn({ id: turnId, status: "inProgress" }) },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "request approval",
+              frame: {
+                id,
+                method: "item/commandExecution/requestApproval",
+                params: {
+                  threadId,
+                  turnId,
+                  itemId: "command",
+                  reason: "Needs approval",
+                  command: "echo test",
+                  startedAtMs: 1,
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "desktop answered",
+              frame: {
+                method: "serverRequest/resolved",
+                params: {
+                  threadId,
+                  requestId: id,
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "turn/completed",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId,
+                  turn: makeCodexReplayTurn({ id: turnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        }),
+        (event) => {
+          if (event.type !== "runtime_request.updated") return Effect.void;
+          if (event.runtimeRequest.status === "pending")
+            return Deferred.succeed(pending, undefined);
+          return Deferred.succeed(closed, event.runtimeRequest);
+        },
+        undefined,
+        undefined,
+        (entry) => (entry.label === "desktop answered" ? Deferred.await(pending) : Effect.void),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        CODEX_DESKTOP_SHARE_DRIVER,
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId,
+          text: prompt,
+        }),
+      );
+      const request = yield* Deferred.await(closed);
+      assert.equal(request.status, "cancelled");
+      assert.ok(request.resolvedAt);
+      yield* harness.firstTerminal;
+      assert.equal(harness.terminalEvents()[0]?.status, "completed");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
 
   describe("Codex file-change approval paths", () => {
     const nativeThreadId = "file-approval-thread";

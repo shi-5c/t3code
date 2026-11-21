@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import { HttpClient } from "effect/http";
 
-import { __resetDesktopPrimaryAuthForTests } from "./desktopAuth";
+import { invalidateDesktopPrimaryBearerToken } from "./desktopAuth";
 import * as PrimaryEnvironmentHttpLayer from "./httpLayer";
 
 function createSignal<A>() {
@@ -17,7 +17,7 @@ function createSignal<A>() {
 
 describe("primary environment HTTP layer", { concurrent: false }, () => {
   afterEach(() => {
-    __resetDesktopPrimaryAuthForTests();
+    invalidateDesktopPrimaryBearerToken();
     Reflect.deleteProperty(globalThis, "window");
     vi.unstubAllGlobals();
   });

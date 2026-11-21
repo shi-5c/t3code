@@ -40,6 +40,21 @@ const config = {
   captureOutput: true,
 };
 
+const desktopSession = (request: HttpClientRequest.HttpClientRequest, authenticated: boolean) =>
+  HttpClientResponse.fromWeb(
+    request,
+    Response.json({
+      authenticated,
+      auth: {
+        policy: "desktop-managed-local",
+        bootstrapMethods: ["desktop-bootstrap"],
+        sessionMethods: ["bearer-access-token"],
+        sessionCookieName: "t3_session",
+      },
+      ...(authenticated ? { sessionMethod: "bearer-access-token", scopes: [] } : {}),
+    }),
+  );
+
 describe("DesktopLocalEnvironmentAuth", () => {
   it.effect("exchanges the desktop bootstrap credential only once", () =>
     Effect.gen(function* () {
@@ -49,23 +64,25 @@ describe("DesktopLocalEnvironmentAuth", () => {
       const layerHttpClient = Layer.succeed(
         HttpClient.HttpClient,
         HttpClient.make((request) =>
-          Ref.update(requestCount, (count) => count + 1).pipe(
-            Effect.as(
-              HttpClientResponse.fromWeb(
-                request,
-                new Response(
-                  JSON.stringify({
-                    access_token: "desktop-bearer-token",
-                    issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
-                    token_type: "Bearer",
-                    expires_in: 3600,
-                    scope: "orchestration:read",
-                  }),
-                  { status: 200, headers: { "content-type": "application/json" } },
+          request.method === "GET"
+            ? Effect.succeed(desktopSession(request, true))
+            : Ref.update(requestCount, (count) => count + 1).pipe(
+                Effect.as(
+                  HttpClientResponse.fromWeb(
+                    request,
+                    new Response(
+                      JSON.stringify({
+                        access_token: "fixture-bearer",
+                        issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+                        token_type: "Bearer",
+                        expires_in: 3600,
+                        scope: "orchestration:read",
+                      }),
+                      { status: 200, headers: { "content-type": "application/json" } },
+                    ),
+                  ),
                 ),
               ),
-            ),
-          ),
         ),
       );
       const layerPool = Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
@@ -98,8 +115,8 @@ describe("DesktopLocalEnvironmentAuth", () => {
         return yield* Fiber.join(tokens);
       }).pipe(Effect.provide(layerTest));
 
-      assert.strictEqual(first, "desktop-bearer-token");
-      assert.strictEqual(second, "desktop-bearer-token");
+      assert.strictEqual(first, "fixture-bearer");
+      assert.strictEqual(second, "fixture-bearer");
       assert.strictEqual(yield* Ref.get(requestCount), 1);
     }).pipe(Effect.provide(TestClock.layer())),
   );
@@ -120,7 +137,7 @@ describe("DesktopLocalEnvironmentAuth", () => {
                   request,
                   new Response(
                     JSON.stringify({
-                      access_token: "desktop-bearer-token",
+                      access_token: "fixture-bearer",
                       issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
                       token_type: "Bearer",
                       expires_in: 3600,
@@ -174,7 +191,7 @@ describe("DesktopLocalEnvironmentAuth", () => {
       request,
       new Response(
         JSON.stringify({
-          access_token: "desktop-bearer-token",
+          access_token: "fixture-bearer",
           issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
           token_type: "Bearer",
           expires_in: 3600,
@@ -193,6 +210,46 @@ describe("DesktopLocalEnvironmentAuth", () => {
       },
     ]),
   } as unknown as DesktopBackendPool.DesktopBackendPool["Service"]);
+
+  it.effect("replaces a cached bearer when the local backend no longer recognizes it", () =>
+    Effect.gen(function* () {
+      const exchanges = yield* Ref.make(0);
+      const httpClient = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          request.method === "GET"
+            ? Effect.succeed(
+                desktopSession(request, request.headers.authorization === "Bearer replacement"),
+              )
+            : Ref.updateAndGet(exchanges, (count) => count + 1).pipe(
+                Effect.map((count) =>
+                  HttpClientResponse.fromWeb(
+                    request,
+                    Response.json({
+                      access_token: count === 1 ? "initial" : "replacement",
+                      issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+                      token_type: "Bearer",
+                      expires_in: 3600,
+                      scope: "orchestration:read",
+                    }),
+                  ),
+                ),
+              ),
+        ),
+      );
+      const auth = yield* DesktopLocalEnvironmentAuth.DesktopLocalEnvironmentAuth.pipe(
+        Effect.provide(
+          DesktopLocalEnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.mergeAll(layerPool, httpClient, NodeCrypto.layerMac)),
+          ),
+        ),
+      );
+      assert.strictEqual(yield* auth.getBearerToken, "initial");
+      assert.strictEqual(yield* auth.getBearerToken, "replacement");
+      assert.strictEqual(yield* auth.getBearerToken, "replacement");
+      assert.strictEqual(yield* Ref.get(exchanges), 2);
+    }),
+  );
   const makeExchange = (failures: number, failure: () => Response) =>
     Effect.gen(function* () {
       const requestCount = yield* Ref.make(0);
