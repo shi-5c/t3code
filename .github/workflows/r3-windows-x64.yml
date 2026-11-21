@@ -1,0 +1,95 @@
+name: R3 Windows x64 installer
+
+on:
+  push:
+    branches: [codex/codex-desktop-share]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r3-windows-x64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  installer:
+    if: github.repository == 'shi-5c/t3code'
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      T3CODE_DESKTOP_SIGNED: "false"
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: shi-5c/t3code
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      # Public checkout avoids vendored gitlink cleanup.
+      - name: Check out the build commit
+        shell: pwsh
+        run: |
+          git init .
+          git config core.longpaths true
+          git remote add origin "https://github.com/$env:GITHUB_REPOSITORY.git"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git fetch --no-tags --depth=1 --filter=blob:none origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Source fetch failed' }
+          git -c checkout.workers=0 checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Source checkout failed' }
+          if ((git rev-parse HEAD) -ne $env:GITHUB_SHA) { throw 'Unexpected source commit' }
+
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Set up Rust for Windows x64
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+          'RUSTUP_TOOLCHAIN=1.95.0' >> $env:GITHUB_ENV
+          "T3CODE_HOME=$env:RUNNER_TEMP/r3-t3-home" >> $env:GITHUB_ENV
+
+      - name: Install locked dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Build unsigned NSIS installer
+        shell: pwsh
+        run: |
+          vp run dist:desktop:win:x64 --build-version "0.0.0-snapshot.$env:GITHUB_RUN_NUMBER" --output-dir release-r3 --keep-stage
+
+      - name: Verify bridge resources and record installer hashes
+        shell: pwsh
+        run: |
+          $stages = @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 't3code-desktop-win-stage-*')
+          if ($stages.Count -ne 1) { throw 'Expected one Windows packaging directory' }
+          $bridge = Join-Path $stages[0].FullName 'app/dist/win-unpacked/resources/codex-desktop-share'
+          foreach ($name in 'CodexDesktopShare.ps1', 'Lifecycle.psm1', 'Forwarder.cs', 'ShareBridge.cs') {
+            $source = Get-FileHash -LiteralPath (Join-Path 'native/codex-desktop-share' $name) -Algorithm SHA256
+            $packed = Get-FileHash -LiteralPath (Join-Path $bridge $name) -Algorithm SHA256
+            if ($source.Hash -cne $packed.Hash) { throw "Packaged bridge file differs from source: $name" }
+          }
+          $installers = @(Get-ChildItem -LiteralPath release-r3 -File -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw 'Expected one Windows x64 installer' }
+          $installer = $installers[0]
+          $hash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
+          "$($hash.Hash.ToLowerInvariant())  $($installer.Name)" | Set-Content -LiteralPath release-r3/SHA256SUMS.txt -Encoding utf8
+          @(
+            "Commit: $env:GITHUB_SHA"
+            "Run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            'Target: Windows x64 NSIS, unsigned'
+            'Codex Desktop Share bridge resources verified against source'
+          ) | Set-Content -LiteralPath release-r3/BUILD.txt -Encoding utf8
+
+      - name: Upload the installer and verification files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: r3-windows-x64-${{ github.run_number }}
+          path: |
+            release-r3/*.exe
+            release-r3/SHA256SUMS.txt
+            release-r3/BUILD.txt
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
